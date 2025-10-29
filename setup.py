@@ -20,12 +20,14 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Debug mode")
     parser.add_argument("--verbose", action="store_true", help="Verbose build")
     parser.add_argument("--rocm-disable-ctx", action="store_true", help="Disable workgroup context optimization in internode")
+    parser.add_argument("--disable-mpi", action="store_true", help="Disable MPI detection and configuration")
 
     # Get the arguments to be parsed and separate setuptools arguments
     args, unknown_args = parser.parse_known_args()
     variant = args.variant
     debug = args.debug
     rocm_disable_ctx = args.rocm_disable_ctx
+    disable_mpi = args.disable_mpi
 
     # Reset sys.argv for setuptools to avoid conflicts
     sys.argv = [sys.argv[0]] + unknown_args
@@ -52,7 +54,8 @@ if __name__ == "__main__":
     ), f"Failed to find {shmem_variant_name}"
     print(f"{shmem_variant_name} directory: {shmem_dir}")
 
-    if variant == "rocm":
+    ompi_dir = None
+    if variant == "rocm" and not disable_mpi:
         # Attempt to auto-detect OpenMPI installation directory if OMPI_DIR not set.
         # The first existing candidate containing bin/mpicc will be used.
         ompi_dir_env = os.getenv("OMPI_DIR", "").strip()
@@ -66,19 +69,20 @@ if __name__ == "__main__":
             "/usr/local/ompi",
             "/usr/local/openmpi",
         ]
-        ompi_dir = None
         for d in candidate_dirs:
             if not d:
                 continue
             mpicc_path = os.path.join(d, "bin", "mpicc")
             if os.path.exists(d) and os.path.exists(mpicc_path):
                 ompi_dir = d
-            break
+                break
         if ompi_dir is None:
             # Fallback to root (will trigger the assert below)
             ompi_dir = "/"
         print(f"Detected OpenMPI directory: {ompi_dir}")
         assert os.path.exists(ompi_dir), f"Failed to find OMPI: {ompi_dir}"
+    elif disable_mpi:
+        print("MPI detection disabled")
 
     # TODO: currently, we only support Hopper architecture, we may add Ampere support later
     if variant == "rocm":
@@ -118,9 +122,13 @@ if __name__ == "__main__":
         ] + debug_symbol_flags
     elif variant == "rocm":
         nvcc_flags = [f"{optimization_flag}"] + debug_symbol_flags + define_macros
+    
+    if disable_mpi:
+        cxx_flags.append("-DDISABLE_MPI=1")
+        nvcc_flags.append("-DDISABLE_MPI=1")
 
     include_dirs = ["csrc/", f"{shmem_dir}/include"]
-    if variant == "rocm":
+    if variant == "rocm" and ompi_dir is not None:
         include_dirs.append(f"{ompi_dir}/include")
 
     sources = [
@@ -132,7 +140,7 @@ if __name__ == "__main__":
     ]
 
     library_dirs = [f"{shmem_dir}/lib"]
-    if variant == "rocm":
+    if variant == "rocm" and ompi_dir is not None:
         library_dirs.append(f"{ompi_dir}/lib")
 
     # Disable aggressive PTX instructions
@@ -154,10 +162,15 @@ if __name__ == "__main__":
                 "-lamdhip64",
                 "-lhsa-runtime64",
                 "-libverbs",
-                f"-l:libmpi.so",
-                f"-Wl,-rpath,{ompi_dir}/lib",
             ]
         )
+        if not disable_mpi:
+            extra_link_args.extend(
+                [
+                    f"-l:libmpi.so",
+                    f"-Wl,-rpath,{ompi_dir}/lib",
+                ]
+            )
 
     extra_compile_args = {
         "cxx": cxx_flags,

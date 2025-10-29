@@ -245,7 +245,7 @@ def test_loop(local_rank: int, num_local_ranks: int, backend: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test internode communication')
-    parser.add_argument('--backend', type=str, choices=['mpi', 'nccl'], default='mpi',
+    parser.add_argument('--backend', type=str, choices=['mpi', 'nccl'], default='nccl',
                         help='Backend for distributed communication (mpi or nccl)')
     args = parser.parse_args()
     num_processes = 8
