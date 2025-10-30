@@ -31,6 +31,10 @@ DeepEP (AMD version) depends on [rocSHMEM](https://github.com/ROCm/rocSHMEM). Pl
 git clone https://github.com/ROCm/DeepEP
 cd DeepEP
 
+# to use DeepEP without MPI, please install it using this command
+python3 setup.py --variant rocm --disable-mpi build develop
+
+# to use DeepEP with MPI, please proceed with these commands
 # export OMPI dir in the next command (e.g., it's $BUILD_DIR/ompi in third-party/README.md)
 export OMPI_DIR=<ompi_dir>
 python3 setup.py --variant rocm build develop
