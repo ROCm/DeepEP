@@ -166,10 +166,6 @@ pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
     return {reinterpret_cast<const char*>(unique_id.data()), unique_id.size()};
 }
 
-pybind11::bytearray Buffer::get_local_pxn_ipc_handle() const {
-    return {pxn_ipc_handles[nvl_rank].reserved, CUDA_IPC_HANDLE_SIZE};
-}
-
 torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
     torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
     auto element_bytes = static_cast<int64_t>(elementSize(casted_dtype));
@@ -227,34 +223,6 @@ void Buffer::sync(const std::vector<int> &device_ids,
     }
     available = true;
 }
-
-void Buffer::sync_pxn_handles(const std::vector<int>& device_ids, const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles) {
-    // Sync NVSHMEM handles and allocate memory
-    if (num_rdma_bytes > 0) {
-        EP_HOST_ASSERT(not is_available());
-        EP_HOST_ASSERT(num_ranks == device_ids.size());
-        EP_HOST_ASSERT(device_ids.size() == all_gathered_handles.size());
-        for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++ i) {
-            EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
-            auto handle_str = std::string(all_gathered_handles[offset + i].value());
-            EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
-            if (offset + i != rank) {
-                std::memcpy(pxn_ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
-                CUDA_CHECK(cudaIpcOpenMemHandle(&nvl_buffer_ptrs[i], pxn_ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
-            } else {
-                EP_HOST_ASSERT(std::memcmp(pxn_ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE) == 0);
-            }
-        }
-        int64_t buffer_ptr_bytes = sizeof(void*) * NUM_MAX_NVL_PEERS;
-        // Barrier
-        internode::barrier();
-        CUDA_CHECK(cudaDeviceSynchronize());
-        // Ready to use
-        available = true;
-    }
-}
-
-
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
 Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
@@ -1322,8 +1290,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
-        .def("get_local_pxn_ipc_handle", &deep_ep::Buffer::get_local_pxn_ipc_handle)
-        .def("sync_pxn_handles", &deep_ep::Buffer::sync_pxn_handles)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
         .def("get_root_rdma_rank", &deep_ep::Buffer::get_root_rdma_rank)

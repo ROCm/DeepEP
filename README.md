@@ -44,6 +44,8 @@ python3 setup.py --variant rocm build develop
 # according to your own cluster settings, and launch into multiple nodes
 python3 tests/test_intranode.py
 python3 tests/test_internode.py
+# Set the required ROCSHMEM heap size (for example, for DeepSeek models) 
+export ROCSHMEM_HEAP_SIZE=2147483648
 python3 tests/test_low_latency.py
 ```
 

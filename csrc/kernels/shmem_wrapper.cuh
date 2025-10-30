@@ -53,6 +53,8 @@ static inline const auto &shmemx_int_put_nbi_warp =
     rocshmem::rocshmem_int_put_nbi_wave;
 static inline const auto &shmemx_int8_put_nbi_warp =
     rocshmem::rocshmem_schar_put_nbi_wave;
+static inline const auto &shmemx_int8_put_nbi =
+    rocshmem::rocshmem_schar_put_nbi;
 static inline const auto &shmem_signal_op_add =
     rocshmem::rocshmem_ulong_atomic_add;
 static inline const auto &shmem_long_atomic_add =
@@ -76,6 +78,8 @@ static inline const auto &shmem_ctx_schar_put_nbi_warp =
     rocshmem::rocshmem_ctx_schar_put_nbi_wave;
 static inline const auto &shmem_ctx_int_put_nbi_warp =
     rocshmem::rocshmem_ctx_int_put_nbi_wave;
+static inline const auto &shmem_ctx_schar_put_nbi =
+    rocshmem::rocshmem_ctx_schar_put_nbi;
 #endif
 #else
 // NVSHMEM wrapper
