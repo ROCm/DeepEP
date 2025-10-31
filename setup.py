@@ -125,10 +125,6 @@ if __name__ == "__main__":
         ] + debug_symbol_flags
     elif variant == "rocm":
         nvcc_flags = [f"{optimization_flag}"] + debug_symbol_flags + define_macros
-    
-    if disable_mpi:
-        cxx_flags.append("-DDISABLE_MPI=1")
-        nvcc_flags.append("-DDISABLE_MPI=1")
 
     include_dirs = ["csrc/", f"{shmem_dir}/include"]
     if variant == "rocm" and ompi_dir is not None:
