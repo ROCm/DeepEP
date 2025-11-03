@@ -79,9 +79,11 @@ if __name__ == "__main__":
             if os.path.exists(d) and os.path.exists(mpicc_path):
                 ompi_dir = d
                 break
-        assert ompi_dir is not None, f"Failed to find OpenMPI installation. 
-            Searched: {', '.join([d for d in candidate_dirs if d])}. 
-            Set OMPI_DIR environment variable or use --disable-mpi flag."
+        assert ompi_dir is not None, (
+            f"Failed to find OpenMPI installation. "
+            f"Searched: {', '.join([d for d in candidate_dirs if d])}. "
+            f"Set OMPI_DIR environment variable or use --disable-mpi flag."
+        )
         print(f"Detected OpenMPI directory: {ompi_dir}")
     elif variant == "rocm" and disable_mpi:
         print("MPI detection disabled for ROCm variant")
