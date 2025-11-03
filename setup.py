@@ -60,6 +60,7 @@ if __name__ == "__main__":
     if variant == "rocm" and not disable_mpi:
         # Attempt to auto-detect OpenMPI installation directory if OMPI_DIR not set.
         # The first existing candidate containing bin/mpicc will be used.
+        print("MPI detection enabled for ROCm variant")
         ompi_dir_env = os.getenv("OMPI_DIR", "").strip()
         candidate_dirs = [
             ompi_dir_env if ompi_dir_env else None,
@@ -82,8 +83,12 @@ if __name__ == "__main__":
             Searched: {', '.join([d for d in candidate_dirs if d])}. 
             Set OMPI_DIR environment variable or use --disable-mpi flag."
         print(f"Detected OpenMPI directory: {ompi_dir}")
-    elif disable_mpi:
-        print("MPI detection disabled")
+    elif variant == "rocm" and disable_mpi:
+        print("MPI detection disabled for ROCm variant")
+    elif variant == "cuda" and not disable_mpi:
+        print("MPI detection enabled for CUDA variant")
+    else:
+        print("MPI detection disabled for CUDA variant")
 
     # TODO: currently, we only support Hopper architecture, we may add Ampere support later
     if variant == "rocm":
