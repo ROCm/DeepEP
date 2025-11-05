@@ -32,12 +32,13 @@ git clone https://github.com/ROCm/DeepEP
 cd DeepEP
 
 
-# to use DeepEP with MPI, please proceed with these commands
-# export OMPI dir in the next command (e.g., it's $BUILD_DIR/ompi in third-party/README.md)
+# To use DeepEP with MPI, please proceed with these commands
+# Export OMPI dir in the next command (e.g., it's $BUILD_DIR/ompi in third-party/README.md)
 export OMPI_DIR=<ompi_dir>
 python3 setup.py --variant rocm build develop
 
-# to use DeepEP without MPI, please install it using this command
+# To use DeepEP without MPI, please make sure rocSHMEM was built with this flag -DUSE_EXTERNAL_MPI=OFF
+# Then install DeepEP using this command
 python3 setup.py --variant rocm --disable-mpi build develop
 
 # Run test cases
