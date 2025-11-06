@@ -65,7 +65,7 @@ static inline const auto &shmem_ibgda_amo_nonfetch_add =
 #if !defined(ROCM_DISABLE_CTX)
 using shmem_ctx_t = rocshmem::rocshmem_ctx_t;
 static inline const auto &shmem_wg_ctx_create = [] __device__(rocshmem::rocshmem_ctx_t *ctx) {
-    rocshmem::rocshmem_wg_ctx_create(0, ctx);
+    return rocshmem::rocshmem_wg_ctx_create(0, ctx);
 };
 static inline const auto &shmem_wg_ctx_destroy =
     rocshmem::rocshmem_wg_ctx_destroy;

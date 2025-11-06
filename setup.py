@@ -7,6 +7,13 @@ import setuptools
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
+# Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
+def get_nvshmem_host_lib_name(base_dir):
+    path = Path(base_dir).joinpath('lib')
+    for file in path.rglob('libnvshmem_host.so.*'):
+        return file.name
+    raise ModuleNotFoundError('libnvshmem_host.so not found')
+
 if __name__ == "__main__":
     # Add argument parser for handling --variant flag
     parser = argparse.ArgumentParser(description="DeepEP setup configuration")
@@ -21,15 +28,38 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="Verbose build")
     parser.add_argument("--enable_timer", action="store_true", help="Enable timer to debug time out in internode")
     parser.add_argument("--rocm-disable-ctx", action="store_true", help="Disable workgroup context optimization in internode")
-    parser.add_argument("--disable-mpi", action="store_true", help="Disable MPI detection and configuration")
 
     # Get the arguments to be parsed and separate setuptools arguments
     args, unknown_args = parser.parse_known_args()
     variant = args.variant
     debug = args.debug
     rocm_disable_ctx = args.rocm_disable_ctx
-    disable_mpi = args.disable_mpi
     enable_timer = args.enable_timer
+
+
+    if variant != "rocm":
+        disable_nvshmem = False
+        nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
+        nvshmem_host_lib = 'libnvshmem_host.so'
+        if nvshmem_dir is None:
+            try:
+                nvshmem_dir = importlib.util.find_spec("nvidia.nvshmem").submodule_search_locations[0]
+                nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
+                import nvidia.nvshmem as nvshmem  # noqa: F401
+            except (ModuleNotFoundError, AttributeError, IndexError):
+                print(
+                    'Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n'
+                )
+                disable_nvshmem = True
+        else:
+            disable_nvshmem = False    
+            
+        if not disable_nvshmem:
+            assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
+            
+    #else:
+    #    disable_nvshmem = False    
+
 
     # Reset sys.argv for setuptools to avoid conflicts
     sys.argv = [sys.argv[0]] + unknown_args
@@ -56,11 +86,9 @@ if __name__ == "__main__":
     ), f"Failed to find {shmem_variant_name}"
     print(f"{shmem_variant_name} directory: {shmem_dir}")
 
-    ompi_dir = None
-    if variant == "rocm" and not disable_mpi:
+    if variant == "rocm":
         # Attempt to auto-detect OpenMPI installation directory if OMPI_DIR not set.
         # The first existing candidate containing bin/mpicc will be used.
-        print("MPI detection enabled for ROCm variant")
         ompi_dir_env = os.getenv("OMPI_DIR", "").strip()
         candidate_dirs = [
             ompi_dir_env if ompi_dir_env else None,
@@ -72,41 +100,30 @@ if __name__ == "__main__":
             "/usr/local/ompi",
             "/usr/local/openmpi",
         ]
+        ompi_dir = None
         for d in candidate_dirs:
             if not d:
                 continue
             mpicc_path = os.path.join(d, "bin", "mpicc")
             if os.path.exists(d) and os.path.exists(mpicc_path):
                 ompi_dir = d
-                break
-        assert ompi_dir is not None, (
-            f"Failed to find OpenMPI installation. "
-            f"Searched: {', '.join([d for d in candidate_dirs if d])}. "
-            f"Set OMPI_DIR environment variable or use --disable-mpi flag."
-        )
+            break
+        if ompi_dir is None:
+            # Fallback to root (will trigger the assert below)
+            ompi_dir = "/"
         print(f"Detected OpenMPI directory: {ompi_dir}")
-    elif variant == "rocm" and disable_mpi:
-        print("MPI detection disabled for ROCm variant")
-    elif variant == "cuda" and not disable_mpi:
-        print("MPI detection enabled for CUDA variant")
-    else:
-        print("MPI detection disabled for CUDA variant")
+        assert os.path.exists(ompi_dir), f"Failed to find OMPI: {ompi_dir}"
 
     # TODO: currently, we only support Hopper architecture, we may add Ampere support later
     if variant == "rocm":
-        arch = os.getenv("PYTORCH_ROCM_ARCH")
-        allowed_arch = {"gfx942", "gfx950"}
-        if arch not in allowed_arch:
-            raise EnvironmentError(
-                f"Invalid PYTORCH_ROCM_ARCH='{arch}'. "
-                f"Use one of: {', '.join(sorted(allowed_arch))}.")
+        os.environ["PYTORCH_ROCM_ARCH"] = os.getenv("PYTORCH_ROCM_ARCH", "gfx942")
     elif variant == "cuda":
         os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
     optimization_flag = "-O0" if debug else "-O3"
     debug_symbol_flags = ["-g", "-ggdb"] if debug else []
     define_macros = (
-        ["-DUSE_ROCM=1", "-fgpu-rdc",] if variant == "rocm" else []
+        ["-DUSE_ROCM=1", "-DDISABLE_SM90_FEATURES=1", "-fgpu-rdc",] if variant == "rocm" else []
     )
     if enable_timer:
         define_macros.append("-DENABLE_TIMER")
@@ -138,25 +155,33 @@ if __name__ == "__main__":
         nvcc_flags = [f"{optimization_flag}"] + debug_symbol_flags + define_macros
 
     include_dirs = ["csrc/", f"{shmem_dir}/include"]
-    if variant == "rocm" and ompi_dir is not None:
+    if variant == "rocm":
         include_dirs.append(f"{ompi_dir}/include")
 
     sources = [
         "csrc/deep_ep.cpp",
         "csrc/kernels/runtime.cu",
+        'csrc/kernels/layout.cu',
         "csrc/kernels/intranode.cu",
         "csrc/kernels/internode.cu",
         "csrc/kernels/internode_ll.cu",
     ]
 
     library_dirs = [f"{shmem_dir}/lib"]
-    if variant == "rocm" and ompi_dir is not None:
+    if variant == "rocm":
         library_dirs.append(f"{ompi_dir}/lib")
 
     # Disable aggressive PTX instructions
     if int(os.getenv("DISABLE_AGGRESSIVE_PTX_INSTRS", "0")):
         cxx_flags.append("-DDISABLE_AGGRESSIVE_PTX_INSTRS")
         nvcc_flags.append("-DDISABLE_AGGRESSIVE_PTX_INSTRS")
+
+
+    # Bits of `topk_idx.dtype`, choices are 32 and 64
+    if "TOPK_IDX_BITS" in os.environ:
+        topk_idx_bits = int(os.environ['TOPK_IDX_BITS'])
+        cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
+        nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
 
     shmem_lib_name = "nvshmem" if variant == "cuda" else "rocshmem"
     # Disable DLTO (default by PyTorch)
@@ -172,15 +197,10 @@ if __name__ == "__main__":
                 "-lamdhip64",
                 "-lhsa-runtime64",
                 "-libverbs",
+                f"-l:libmpi.so",
+                f"-Wl,-rpath,{ompi_dir}/lib",
             ]
         )
-        if not disable_mpi:
-            extra_link_args.extend(
-                [
-                    f"-l:libmpi.so",
-                    f"-Wl,-rpath,{ompi_dir}/lib",
-                ]
-            )
 
     extra_compile_args = {
         "cxx": cxx_flags,
@@ -188,6 +208,17 @@ if __name__ == "__main__":
     }
     if variant == "cuda":
         extra_compile_args["nvcc_dlink"] = nvcc_dlink
+
+
+    # Summary
+    print('Build summary:')
+    print(f' > Sources: {sources}')
+    print(f' > Includes: {include_dirs}')
+    print(f' > Libraries: {library_dirs}')
+    print(f' > Compilation flags: {extra_compile_args}')
+    print(f' > Link flags: {extra_link_args}')
+    print(f' > NVSHMEM path: {shmem_dir}')
+    print()
 
     # noinspection PyBroadException
     try:
@@ -198,7 +229,7 @@ if __name__ == "__main__":
 
     setuptools.setup(
         name="deep_ep",
-        version="1.0.0" + revision,
+        version="1.2.1" + revision,
         packages=setuptools.find_packages(include=["deep_ep"]),
         ext_modules=[
             CUDAExtension(

@@ -406,18 +406,36 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
     }
 }
 
-void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
-                     const int* num_tokens_per_rdma_rank, int* moe_recv_rdma_counter_mapped,
-                     const int* num_tokens_per_expert, int* moe_recv_expert_counter_mapped, int num_experts,
-                     const bool* is_token_in_rank, int num_tokens, int num_channels,
-                     int hidden_int4, int num_scales, int num_topk, int expert_alignment,
-                     int* rdma_channel_prefix_matrix, int* recv_rdma_rank_prefix_sum,
-                     int* gbl_channel_prefix_matrix, int* recv_gbl_rank_prefix_sum,
-                     void* rdma_buffer_ptr, int num_max_rdma_chunked_recv_tokens,
-                     void** buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
-                     int** task_fifo_ptrs, int head, int rank,
-                     cudaStream_t stream, int64_t num_rdma_bytes, int64_t num_nvl_bytes,
-                     bool low_latency_mode) {
+void notify_dispatch(const int* num_tokens_per_rank,
+                     int* moe_recv_counter_mapped,
+                     int num_ranks,
+                     const int* num_tokens_per_rdma_rank,
+                     int* moe_recv_rdma_counter_mapped,
+                     const int* num_tokens_per_expert,
+                     int* moe_recv_expert_counter_mapped,
+                     int num_experts,
+                     const bool* is_token_in_rank,
+                     int num_tokens,
+                     int num_channels,
+                     int hidden_int4,
+                     int num_scales,
+                     int num_topk,
+                     int expert_alignment,
+                     int* rdma_channel_prefix_matrix,
+                     int* recv_rdma_rank_prefix_sum,
+                     int* gbl_channel_prefix_matrix,
+                     int* recv_gbl_rank_prefix_sum,
+                     void* rdma_buffer_ptr,
+                     int num_max_rdma_chunked_recv_tokens,
+                     void** buffer_ptrs,
+                     int num_max_nvl_chunked_recv_tokens,
+                     int** barrier_signal_ptrs,
+                     int rank,
+                     cudaStream_t stream,
+                     int64_t num_rdma_bytes,
+                     int64_t num_nvl_bytes,
+                     bool low_latency_mode, 
+                     int head = 0) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(num_rdma_ranks) { \
     auto notify_dispatch_func = low_latency_mode ? \
         notify_dispatch<true, num_rdma_ranks> : notify_dispatch<false, num_rdma_ranks>; \
@@ -431,7 +449,7 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                   rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
                   gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
                   rdma_buffer_ptr, \
-                  buffer_ptrs, task_fifo_ptrs, head, rank, \
+                  buffer_ptrs, barrier_signal_ptrs, head, rank, \
                   cpu_rdma_team); } break
 
     constexpr int kNumThreads = 256;
@@ -1135,18 +1153,43 @@ asm volatile(
 #endif
 }
 
-void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv_topk_weights, void* recv_src_meta,
-              const void* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
-              int* send_rdma_head, int* send_nvl_head,
-              int* recv_rdma_channel_prefix_matrix, int* recv_gbl_channel_prefix_matrix,
-              const int* rdma_channel_prefix_matrix, const int* recv_rdma_rank_prefix_sum,
-              const int* gbl_channel_prefix_matrix, const int* recv_gbl_rank_prefix_sum,
-              int num_tokens, int hidden_int4, int num_scales, int num_topk, int num_experts,
+void dispatch(void* recv_x,
+              float* recv_x_scales,
+              topk_idx_t* recv_topk_idx,
+              float* recv_topk_weights,
+              void* recv_src_meta,
+              const void* x,
+              const float* x_scales,
+              const topk_idx_t* topk_idx,
+              const float* topk_weights,
+              int* send_rdma_head,
+              int* send_nvl_head,
+              int* recv_rdma_channel_prefix_matrix,
+              int* recv_gbl_channel_prefix_matrix,
+              const int* rdma_channel_prefix_matrix,
+              const int* recv_rdma_rank_prefix_sum,
+              const int* gbl_channel_prefix_matrix,
+              const int* recv_gbl_rank_prefix_sum,
               const bool* is_token_in_rank,
-              void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
-              void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
-              int rank, int num_ranks, bool is_cached_dispatch,
-              cudaStream_t stream, int num_channels, bool low_latency_mode) {
+              int num_tokens,
+              int hidden_int4,
+              int num_scales,
+              int num_topk,
+              int num_experts,
+              int scale_token_stride,
+              int scale_hidden_stride,
+              void* rdma_buffer_ptr,
+              int num_max_rdma_chunked_send_tokens,
+              int num_max_rdma_chunked_recv_tokens,
+              void** buffer_ptrs,
+              int num_max_nvl_chunked_send_tokens,
+              int num_max_nvl_chunked_recv_tokens,
+              int rank,
+              int num_ranks,
+              bool is_cached_dispatch,
+              cudaStream_t stream,
+              int num_channels,
+              bool low_latency_mode) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
 
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks) { \
@@ -1284,14 +1327,29 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
     }
 }
 
-void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights,
-                   int num_ranks, int num_channels, int num_combined_tokens, int* combined_rdma_head,
-                   const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum, int* combined_nvl_head,
-                   void* rdma_buffer_ptr, int num_max_rdma_chunked_recv_tokens,
-                   void** buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
-                   int** task_fifo_ptrs, int head, int rank, cudaStream_t stream,
-                   int64_t num_rdma_bytes, int64_t num_nvl_bytes,
-                   bool is_cached_dispatch, bool low_latency_mode) {
+void cached_notify(int hidden_int4,
+                   int num_scales,
+                   int num_topk_idx,
+                   int num_topk_weights,
+                   int num_ranks,
+                   int num_channels,
+                   int num_combined_tokens,
+                   int* combined_rdma_head,
+                   const int* rdma_channel_prefix_matrix,
+                   const int* rdma_rank_prefix_sum,
+                   int* combined_nvl_head,
+                   void* rdma_buffer_ptr,
+                   int num_max_rdma_chunked_recv_tokens,
+                   void** buffer_ptrs,
+                   int num_max_nvl_chunked_recv_tokens,
+                   int** barrier_signal_ptrs,
+                   int rank,
+                   cudaStream_t stream,
+                   int64_t num_rdma_bytes,
+                   int64_t num_nvl_bytes,
+                   bool is_cached_dispatch,
+                   bool low_latency_mode,
+                   int head = 0) {
     const int num_threads = std::max(128, kWarpSize * num_channels);
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
 
@@ -1313,7 +1371,7 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
                   combined_rdma_head, num_combined_tokens, num_channels,
                   rdma_channel_prefix_matrix, rdma_rank_prefix_sum, combined_nvl_head,
                   rdma_buffer_ptr,
-                  buffer_ptrs, task_fifo_ptrs, head, rank, num_ranks,
+                  buffer_ptrs, barrier_signal_ptrs, head, rank, num_ranks,
                   is_cached_dispatch, cpu_rdma_team);
 }
 
@@ -1962,16 +2020,36 @@ combine(int4* combined_x, float* combined_topk_weights,
 #endif
 }
 
+
 void combine(cudaDataType_t type,
-             void* combined_x, float* combined_topk_weights,
+             void* combined_x,
+             float* combined_topk_weights,
              const bool* is_combined_token_in_rank,
-             const void* x, const float* topk_weights,
-             const int* combined_rdma_head, const int* combined_nvl_head,
-             const void* src_meta, const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum, const int* gbl_channel_prefix_matrix,
-             int num_tokens, int num_combined_tokens, int hidden, int num_topk,
-             void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
-             void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
-             int rank, int num_ranks, cudaStream_t stream, int num_channels, bool low_latency_mode)
+             const void* x,
+             const float* topk_weights,
+             const void* bias_0,
+             const void* bias_1,
+             const int* combined_rdma_head,
+             const int* combined_nvl_head,
+             const void* src_meta,
+             const int* rdma_channel_prefix_matrix,
+             const int* rdma_rank_prefix_sum,
+             const int* gbl_channel_prefix_matrix,
+             int num_tokens,
+             int num_combined_tokens,
+             int hidden,
+             int num_topk,
+             void* rdma_buffer_ptr,
+             int num_max_rdma_chunked_send_tokens,
+             int num_max_rdma_chunked_recv_tokens,
+             void** buffer_ptrs,
+             int num_max_nvl_chunked_send_tokens,
+             int num_max_nvl_chunked_recv_tokens,
+             int rank,
+             int num_ranks,
+             cudaStream_t stream,
+             int num_channels,
+             bool low_latency_mode)
 {
     const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
 
