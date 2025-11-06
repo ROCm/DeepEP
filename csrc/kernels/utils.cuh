@@ -2,6 +2,10 @@
 
 #include "exception.cuh"
 
+#ifdef USE_ROCM
+#define syncthreads() __syncthreads()
+#endif
+
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC) \
 { \
     constexpr int kLoopStride = kWarpSize * (UNROLL_FACTOR); \
@@ -596,15 +600,6 @@ __device__ __forceinline__ void st_na_release(const uint32_t *ptr, uint32_t val)
 #endif
 }
 
-__device__ __forceinline__ void st_na_release(const int64_t *ptr, int64_t val) {
-#ifdef USE_ROCM
-    int64_t* non_const_ptr = const_cast<int64_t*>(ptr);
-    __hip_atomic_store(non_const_ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#else
-    asm volatile("st.release.gpu.global.L1::no_allocate.b64 [%0], %1;" : : "l"(ptr), "l"(val));
-#endif
-}
-
 __device__ __forceinline__ void st_na_release(const uint64_t *ptr, uint64_t val) {
 #ifdef USE_ROCM
     uint64_t* non_const_ptr = const_cast<uint64_t*>(ptr);
@@ -795,4 +790,64 @@ barrier_device(int **task_fifo_ptrs, int head, int rank, int tag = 0) {
     timeout_check<kNumRanks>(task_fifo_ptrs, head, rank, 0, tag);
 }
 
+
+template <int kNumRanks, bool kSyncOnly = false>
+__forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {
+    auto thread_id = static_cast<int>(threadIdx.x);
+
+    // For non-sync-only cases, the memory operations by other threads in the block must be visible to the `sys` scope
+    if constexpr (not kSyncOnly) {
+        memory_fence();
+        __syncthreads();
+    }
+
+    // Add self-ranks, sub other ranks
+    if (thread_id < kNumRanks) {
+        atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
+        atomicSub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
+    }
+    EP_DEVICE_ASSERT(kNumRanks <= blockDim.x);
+
+    // Check timeout
+    auto start_time = clock64();
+    while (true) {
+        auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
+        if (__all_sync(kFullWarpMask, value <= 0))
+            break;
+
+        if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
+            printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value);
+            trap();
+        }
+    }
+    __syncthreads();
+}
+
+
+__device__ __forceinline__ uint32_t elect_one_sync() {
+#ifndef DISABLE_SM90_FEATURES
+    uint32_t pred = 0;
+    asm volatile(
+        "{\n"
+        ".reg .b32 %%rx;\n"
+        ".reg .pred %%px;\n"
+        "      elect.sync %%rx|%%px, %1;\n"
+        "@%%px mov.s32 %0, 1;\n"
+        "}\n"
+        : "+r"(pred)
+        : "r"(0xffffffff));
+    return pred;
+#else
+    return get_lane_id() == 0;
+#endif
+}
+
 } // namespace deep_ep
+
+template <typename dtype_t>
+__host__ __device__ constexpr dtype_t align_down(dtype_t a, dtype_t b) {
+    return a / b * b;
+}
+
+
+

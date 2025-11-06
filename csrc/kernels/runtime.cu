@@ -16,9 +16,19 @@ __global__ void barrier(int** task_fifo_ptrs, int head, int rank) {
     barrier_device<kNumRanks>(task_fifo_ptrs, head, rank);
 }
 
-void barrier(int** task_fifo_ptrs, int head, int rank, int num_ranks, cudaStream_t stream) {
+/*void barrier(int** task_fifo_ptrs, int head, int rank, int num_ranks, cudaStream_t stream) {
 #define BARRIER_LAUNCH_CASE(ranks) \
     LAUNCH_KERNEL(&cfg, barrier<ranks>, task_fifo_ptrs, head, rank); \
+    break
+
+    SETUP_LAUNCH_CONFIG(1, kWarpSize, stream);
+    SWITCH_RANKS(BARRIER_LAUNCH_CASE);
+#undef BARRIER_LAUNCH_CASE
+}*/
+
+void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream, int head = 0) {
+#define BARRIER_LAUNCH_CASE(ranks)                                  \
+    LAUNCH_KERNEL(&cfg, barrier<ranks>, barrier_signal_ptrs, head, rank); \
     break
 
     SETUP_LAUNCH_CONFIG(1, kWarpSize, stream);
@@ -53,8 +63,13 @@ int init(const std::vector<uint8_t> &root_unique_id_val, int rank, int num_ranks
     if (low_latency_mode and num_ranks > NUM_MAX_NVL_PEERS) {
         EP_HOST_ASSERT(cpu_rdma_team == SHMEM_TEAM_INVALID);
         EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
-        EP_HOST_ASSERT(shmem_team_split_strided(SHMEM_TEAM_WORLD, rank % NUM_MAX_NVL_PEERS, NUM_MAX_NVL_PEERS,
-                                                num_ranks / NUM_MAX_NVL_PEERS, &cpu_rdma_team_config, 0, &cpu_rdma_team) == 0);
+        EP_HOST_ASSERT(shmem_team_split_strided(SHMEM_TEAM_WORLD, 
+                                                rank % NUM_MAX_NVL_PEERS, 
+                                                NUM_MAX_NVL_PEERS,
+                                                num_ranks / NUM_MAX_NVL_PEERS, 
+                                                &cpu_rdma_team_config, 
+                                                0, 
+                                                &cpu_rdma_team) == 0);
        //TODO::issue on ROCM: enable it for ROCM
 #ifndef USE_ROCM
         EP_HOST_ASSERT(cpu_rdma_team != SHMEM_TEAM_INVALID);
