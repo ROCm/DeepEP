@@ -61,8 +61,8 @@ if __name__ == "__main__":
         if not disable_nvshmem:
             assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
             
-    #else:
-    #    disable_nvshmem = False    
+    else:
+        disable_nvshmem = False    
 
 
     # Reset sys.argv for setuptools to avoid conflicts
@@ -114,10 +114,13 @@ if __name__ == "__main__":
             mpicc_path = os.path.join(d, "bin", "mpicc")
             if os.path.exists(d) and os.path.exists(mpicc_path):
                 ompi_dir = d
-            break
-        if ompi_dir is None:
-            # Fallback to root (will trigger the assert below)
-            ompi_dir = "/"
+                break
+        
+        assert ompi_dir is not None, (
+            f"Failed to find OpenMPI installation. "
+            f"Searched: {', '.join([d for d in candidate_dirs if d])}. "
+            f"Set OMPI_DIR environment variable or use --disable-mpi flag."
+        )             
         print(f"Detected OpenMPI directory: {ompi_dir}")
     elif variant == "rocm" and not enable_mpi:
         print("MPI detection disabled for ROCm variant")
@@ -128,7 +131,12 @@ if __name__ == "__main__":
 
     # TODO: currently, we only support Hopper architecture, we may add Ampere support later
     if variant == "rocm":
-        os.environ["PYTORCH_ROCM_ARCH"] = os.getenv("PYTORCH_ROCM_ARCH", "gfx942")
+        arch = os.getenv("PYTORCH_ROCM_ARCH")
+        allowed_arch = {"gfx942", "gfx950"}
+        if arch not in allowed_arch:
+            raise EnvironmentError(
+                f"Invalid PYTORCH_ROCM_ARCH='{arch}'. "
+                f"Use one of: {', '.join(sorted(allowed_arch))}.")
     elif variant == "cuda":
         os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
@@ -170,7 +178,7 @@ if __name__ == "__main__":
         nvcc_flags = [f"{optimization_flag}"] + debug_symbol_flags + define_macros
 
     include_dirs = ["csrc/", f"{shmem_dir}/include"]
-    if variant == "rocm":
+    if variant == "rocm" and ompi_dir is not None:
         include_dirs.append(f"{ompi_dir}/include")
 
     sources = [
@@ -183,7 +191,7 @@ if __name__ == "__main__":
     ]
 
     library_dirs = [f"{shmem_dir}/lib"]
-    if variant == "rocm":
+    if variant == "rocm" and ompi_dir is not None:
         library_dirs.append(f"{ompi_dir}/lib")
 
     # Disable aggressive PTX instructions
@@ -212,8 +220,6 @@ if __name__ == "__main__":
                 "-lamdhip64",
                 "-lhsa-runtime64",
                 "-libverbs",
-                f"-l:libmpi.so",
-                f"-Wl,-rpath,{ompi_dir}/lib",
             ]
         )
         if enable_mpi:
@@ -240,6 +246,7 @@ if __name__ == "__main__":
     print(f' > Compilation flags: {extra_compile_args}')
     print(f' > Link flags: {extra_link_args}')
     print(f' > NVSHMEM path: {shmem_dir}')
+    print(f' > Disable MPI: {disable_mpi}')
     print()
 
     # noinspection PyBroadException

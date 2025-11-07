@@ -58,6 +58,11 @@ export OMPI_DIR=<ompi_dir>
 # Then install DeepEP using this command
 python3 setup.py --variant rocm --enable-mpi --nic <NIC_TYPE> build develop --user
 
+
+# To use DeepEP without MPI, please make sure rocSHMEM was built with this flag -DUSE_EXTERNAL_MPI=OFF
+# Then install DeepEP using this command
+python3 setup.py --variant rocm --disable-mpi build develop
+
 # Run test cases
 # NOTES: you may modify the `init_dist` function in `tests/utils.py`
 # according to your own cluster settings, and launch into multiple nodes
