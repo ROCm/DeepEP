@@ -23,6 +23,12 @@ MPI_ROOT=$BUILD_DIR/ompi ../rocSHMEM/scripts/build_configs/gda_mlx5 --fresh \
   -DUSE_IPC=ON \
   -DGDA_BNXT=ON
 
+# To build rocSHMEM with MPI disabled, please add this flag -DUSE_EXTERNAL_MPI=OFF
+MPI_ROOT=$BUILD_DIR/ompi ../rocSHMEM/scripts/build_configs/gda_mlx5 --fresh \
+  -DUSE_IPC=ON \
+  -DGDA_BNXT=ON
+  -DUSE_EXTERNAL_MPI=OFF
+
 # You may pass additional arguments to Cmake,
 #   e.g., -DBUILD_LOCAL_GPU_TARGET_ONLY=ON
 ```
