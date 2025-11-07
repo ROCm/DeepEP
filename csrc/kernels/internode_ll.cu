@@ -195,7 +195,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     for (int j = 0;j < kNumElemsPerRead;j += 2) {
                         float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
 #ifdef USE_ROCM
+#if defined(__gfx942__)
                         fp8x2_values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
+#endif
+#if defined(__gfx950__)
+                        fp8x2_values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3);
+#endif
 #else
                         fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
 #endif
