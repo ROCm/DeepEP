@@ -298,7 +298,7 @@ def test_main(args: argparse.Namespace,
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks,  backend=args.backend)
     if args.test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
@@ -353,6 +353,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test internode EP kernels')
+    parser.add_argument('--backend', type=str, choices=['mpi', 'nccl'], default='nccl',help='Backend for distributed communication (mpi or nccl)')    
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
     parser.add_argument('--num-tokens', type=int, default=4096, help='Number of tokens (default: 4096)')
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden dimension size (default: 7168)')
@@ -373,4 +374,11 @@ if __name__ == '__main__':
         args.num_topk_groups = min(num_nodes, 4)
 
     num_processes = args.num_processes
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+    if args.backend == 'mpi':
+        dist.init_process_group(backend='mpi')
+        rank = dist.get_rank()
+        local_rank = rank % num_processes
+        test_loop(local_rank=local_rank, num_local_ranks=num_processes, args=args)
+    else:
+        torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+
