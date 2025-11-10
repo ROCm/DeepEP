@@ -16,15 +16,6 @@ __global__ void barrier(int** task_fifo_ptrs, int head, int rank) {
     barrier_device<kNumRanks>(task_fifo_ptrs, head, rank);
 }
 
-/*void barrier(int** task_fifo_ptrs, int head, int rank, int num_ranks, cudaStream_t stream) {
-#define BARRIER_LAUNCH_CASE(ranks) \
-    LAUNCH_KERNEL(&cfg, barrier<ranks>, task_fifo_ptrs, head, rank); \
-    break
-
-    SETUP_LAUNCH_CONFIG(1, kWarpSize, stream);
-    SWITCH_RANKS(BARRIER_LAUNCH_CASE);
-#undef BARRIER_LAUNCH_CASE
-}*/
 
 void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream, int head = 0) {
 #define BARRIER_LAUNCH_CASE(ranks)                                  \

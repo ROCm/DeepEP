@@ -170,8 +170,6 @@ public:
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,
         const std::optional<torch::Tensor>& topk_weights,
-        //const std::optional<torch::Tensor>& bias_0,
-        //const std::optional<torch::Tensor>& bias_1,
         const torch::Tensor& src_idx,
         const torch::Tensor& rank_prefix_matrix,
         const torch::Tensor& channel_prefix_matrix,

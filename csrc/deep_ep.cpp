@@ -784,6 +784,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     
 
     // Assign bias pointers
+    // At this time, the optional bias is not supported by the underlying kernels. 
     /*auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
     void* bias_ptrs[2] = {nullptr, nullptr};
     for (int i = 0; i < 2; ++i)
