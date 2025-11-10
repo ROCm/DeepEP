@@ -2,10 +2,6 @@
 
 #include "exception.cuh"
 
-#ifdef USE_ROCM
-#define syncthreads() __syncthreads()
-#endif
-
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC) \
 { \
     constexpr int kLoopStride = kWarpSize * (UNROLL_FACTOR); \
