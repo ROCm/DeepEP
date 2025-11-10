@@ -203,6 +203,10 @@ if __name__ == "__main__":
     # Bits of `topk_idx.dtype`, choices are 32 and 64
     if "TOPK_IDX_BITS" in os.environ:
         topk_idx_bits = int(os.environ['TOPK_IDX_BITS'])
+        assert topk_idx_bits in (32, 64), (
+            f"Invalid TOPK_IDX_BITS={topk_idx_bits}. "
+            "Must be either 32 or 64."
+        )        
         cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
         nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
 
