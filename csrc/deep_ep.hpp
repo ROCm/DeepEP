@@ -47,6 +47,9 @@ private:
 
     // Device info and communication
     int device_id;
+#ifdef USE_ROCM
+    int gfx;
+#endif    
     int num_device_sms;
     int rank, rdma_rank, nvl_rank;
     int num_ranks, num_rdma_ranks, num_nvl_ranks;

@@ -57,6 +57,10 @@ Buffer::Buffer(int rank,
     // Get device info
     cudaDeviceProp device_prop = {};
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device_id));
+#ifdef USE_ROCM
+    sscanf(device_prop.gcnArchName, "gfx%d", &gfx);
+    EP_HOST_ASSERT(gfx >= 942);
+#endif    
     num_device_sms = device_prop.multiProcessorCount;
 
     // Number of per-channel bytes cannot be large
@@ -1500,7 +1504,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     // Allocate packed tensors
 #ifdef USE_ROCM
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-                                      x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fnuz : torch::kBFloat16));
+                                      x.options().dtype(use_fp8 ? (gfx == 942 ? torch::kFloat8_e4m3fnuz : torch::kFloat8_e4m3fn) : torch::kBFloat16));
 #else
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
                                       x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
