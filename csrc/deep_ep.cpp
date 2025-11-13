@@ -131,28 +131,8 @@ Buffer::~Buffer() noexcept(false) {
         printf("WARNING: destroy() was not called before DeepEP buffer destruction, which can leak resources.\n");
         fflush(stdout);
     }
-
-    // Free NVSHMEM
-    if (num_rdma_bytes > 0) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        internode::barrier();
-        internode::free(rdma_buffer_ptr);
-        internode::finalize();
-    }
-
-    // Free cuBLAS handle, workspace and MoE counter
-    CUDA_CHECK(cudaFree(workspace));
-    CUDA_CHECK(cudaFree(dispatch_global_atomic_counter));
-    CUDA_CHECK(cudaFree(combine_global_atomic_counter));
-    CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_counter)));
-
-    // Free chunked mode staffs
-    CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_expert_counter)));
 }
 
-void Buffer::move_fifo_slots(int num_slots) {
-    head = (head + num_ranks * num_slots) % NUM_MAX_FIFO_SLOTS;
-}
 
 bool Buffer::is_available() const {
     return available;
