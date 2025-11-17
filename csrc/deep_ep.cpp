@@ -1098,10 +1098,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
 
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
-     
-       if (not return_recv_hook)
-       stream_wait(compute_stream, launch_stream);
-     internode::barrier();
     auto launcher = [=](int phases) {
         internode_ll::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
                             packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
@@ -1199,11 +1195,9 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     } else {
         combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
     }
+
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
-    if (not return_recv_hook)
-       stream_wait(compute_stream, launch_stream);
-    internode::barrier();
     auto launcher = [=](int phases) {
         internode_ll::combine(combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,

@@ -16,13 +16,11 @@ namespace deep_ep {
 
 namespace internode_ll {
 
-__device__ void grid_barrier(int* global_counter, int num_blocks, int do_fence=1) {
+__device__ void grid_barrier(int* global_counter, int num_blocks) {
 volatile int ret;
     __syncthreads();
        if (threadIdx.x == 0 ) {
-        if (do_fence)
               __threadfence();
- 
 	       ret = __hip_atomic_fetch_add( &global_counter[0], 1,
                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
@@ -75,7 +73,7 @@ void clean_low_latency_buffer(int64_t* clean_0, int num_clean_int_0,
                   clean_0, num_clean_int_0, clean_1, num_clean_int_1);
 }
 
-template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
+template <bool kUseFP8, bool multinode, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * kWarpSize, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
@@ -100,7 +98,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
 #if !defined(ROCM_DISABLE_CTX)
     __shared__ internode::shmem_ctx_t ctx;
-    internode::shmem_wg_ctx_create(&ctx);
+    if constexpr (multinode) {
+        EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0);
+    }
 #endif
 
     // FP8 staffs
@@ -122,18 +122,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
-//#ifdef USE_ROCM
-//    // 16 is the max possible number of warps in AMD GPUs 
-//    constexpr int kMaxNumWarps = 1024 / kWarpSize;
-//    constexpr int num_sync_large_iteration = kMaxNumWarps ;
-//    __shared__ volatile uint8_t sync_large_warp_counters[num_sync_large_iteration];
-//
-//    #pragma unroll
-//    for (int i = thread_id; i < num_sync_large_iteration; i += blockDim.x) {
-//        sync_large_warp_counters[i] = 0;
-//    }
-//    __syncthreads();
-//#endif
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_DISPATCH_RECV;
@@ -148,7 +136,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(gpu_bfloat16_t);
         EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
         EP_STATIC_ASSERT(kNumElemsPerRead * kWarpSize % kNumPerChannels == 0, "Invalid vectorization");
-        //const auto num_threads = (num_warps - 1) * kWarpSize;
         constexpr int num_threads = kNumWarpGroups * kNumWarpsPerGroup * kWarpSize; 
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
@@ -239,7 +226,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmemx_int8_put_nbi_warp(
 #else
-                    internode::shmem_ctx_schar_put_nbi_warp(ctx,
+                    if constexpr (multinode)
+                        internode::shmem_ctx_schar_put_nbi_warp(ctx,
 #endif
                     reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(src_ptr), num_bytes_per_msg, dst_rank);
 #else
@@ -268,12 +256,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             #pragma unroll
             for (int i = lane_id; i < num_next_clean_int; i += kWarpSize)
                 next_clean[i] = 0;
-
-            // Notify before executing `int_p`
-            //syncwarp();
-            //#pragma unroll
-            //for (int i = lane_id; i < num_experts; i += kWarpSize)
-            //    atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
         }
         // This SM should be responsible for some destination experts, read `topk_idx` for them
         int expert_count[kNumWarpGroups] = {0};
@@ -299,16 +281,16 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
     }
 
-#if 0
-    if (thread_id == 0 and num_ranks > 8){
+    if constexpr (multinode){
+        if (thread_id == 0 ){
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmem_fence();
 #else
-                    internode::shmem_ctx_quiet(ctx);
+                    if constexpr (multinode)
+                        internode::shmem_ctx_quiet(ctx);
 #endif
+        }
     }
-#endif
-    //revert sync_large_warp_counters to 0 for next sync
     __syncthreads();
 
     // Issue count sends
@@ -322,11 +304,15 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank != rank) {
 #ifdef USE_ROCM
 #if defined(ROCM_DISABLE_CTX)
-           //internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
-           rocshmem::rocshmem_long_p(        rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
-           
+            if constexpr (multinode){ // does CTX depend on multinode?
+                internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+            }else{
+                rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+            }
 #else
-           internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+            if constexpr (multinode){
+               internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+            }
 #endif
 #else //CUDA
            nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
@@ -343,11 +329,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank == 0)
             packed_recv_count[dst_expert_local_idx] = 0;
     }
-    //syncwarp();
 
     // Receiving phase
     LOW_LATENCY_DISPATCH_RECV:
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
+        if constexpr (multinode)
+            #if defined(USE_ROCM) && !defined(ROCM_DISABLE_CTX) && defined(multinode)
+                    internode::shmem_wg_ctx_destroy(&ctx);
+            #endif
         return;
 
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
@@ -375,7 +364,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         int num_recv_tokens, recv_token_begin_idx;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         if (sub_warp_id == 0 and lane_id == 0) {
-            while ((num_recv_tokens = ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0);
+            if constexpr (multinode){
+                while ((num_recv_tokens = ld_acquire_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0);
+            }else{
+                while ((num_recv_tokens = ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0);
+            }
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
@@ -383,15 +376,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
         }
 #ifdef USE_ROCM
-        // no needs to reset because there is no iteration
-     //   if (lane_id == 0){
-     //       volatile int ret = __hip_atomic_fetch_add(
-     //           &sync_large_warp_counters[warp_group_id], 1,
-     //           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-     //   }
-     //   syncwarp();
-     //   while (sync_large_warp_counters[warp_group_id] < (kNumWarpsPerGroup));
-	  __syncthreads();
+	__syncthreads();
 #else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(kNumWarpsPerGroup * 32));
 #endif
@@ -426,7 +411,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
     }
 #if !defined(ROCM_DISABLE_CTX)
-    internode::shmem_wg_ctx_destroy(&ctx);
+    if constexpr (multinode) {
+        internode::shmem_wg_ctx_destroy(&ctx);
+    }
 #endif
 }
 
@@ -459,10 +446,17 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
-
+    
+    bool multinode = (num_ranks > 8);
 #define DISPATCH_LAUNCH_CASE(hidden) { \
-auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
-                               dispatch<false, kNumWarpGroups, kNumWarpsPerGroup, hidden>; \
+  auto dispatch_func =                                                                      \
+    use_fp8                                                                                 \
+      ? ( multinode                                                                          \
+            ? dispatch<true,  true,  kNumWarpGroups, kNumWarpsPerGroup, hidden>            \
+            : dispatch<true,  false, kNumWarpGroups, kNumWarpsPerGroup, hidden> )          \
+      : ( multinode                                                                          \
+            ? dispatch<false, true,  kNumWarpGroups, kNumWarpsPerGroup, hidden>            \
+            : dispatch<false, false, kNumWarpGroups, kNumWarpsPerGroup, hidden> );         \
 LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
@@ -480,7 +474,7 @@ LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, dispatch_func, \
 #undef DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
+template <bool multinode, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * kWarpSize, 1) void
 combine(void* combined_x,
         void* rdma_recv_x, int64_t* rdma_recv_flag, void* rdma_send_x,
@@ -496,7 +490,9 @@ combine(void* combined_x,
 
 #if !defined(ROCM_DISABLE_CTX)
     __shared__ internode::shmem_ctx_t ctx;
-    internode::shmem_wg_ctx_create(&ctx);
+    if constexpr (multinode) {
+        EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0);
+    }
 #endif
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -516,20 +512,6 @@ combine(void* combined_x,
     // BF16 mode: always use BF16 for hidden data (ignoring the extra flag slot)
     constexpr size_t num_bytes_per_slot = sizeof(int4) + kHidden * sizeof(gpu_bfloat16_t);
     // EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
-//     __syncthreads();
-// #ifdef USE_ROCM
-//     // 16 is the max possible number of warps in AMD GPUs 
-//     constexpr int kMaxNumWarps = 1024 / kWarpSize;
-//     __shared__ volatile int sync_large_warp_counters[kMaxNumWarps];
-//     if (threadIdx.x==0){
-//         // printf("combine");
-//         #pragma unroll
-//         for (int i = 0; i < kMaxNumWarps; ++i) {
-//             sync_large_warp_counters[i] = 0;
-//         }
-//     }
-//     __syncthreads();
-// #endif
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -583,33 +565,27 @@ combine(void* combined_x,
                 
                 //nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, hidden * sizeof(gpu_bfloat16_t), dst_rank, local_expert_idx, lane_id, token_idx - offset);
 #if defined(ROCM_DISABLE_CTX)
-                    internode::shmemx_int8_put_nbi_warp(
+                    internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
 #else
-                    internode::shmem_ctx_schar_put_nbi_warp(ctx,
+                    if constexpr (multinode) {
+                        internode::shmem_ctx_schar_put_nbi_warp(ctx,reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
+                    }
 #endif
-                    reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
-#if 0
-                if (num_ranks > 8){
+                if constexpr (multinode){
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmem_fence();
 #else
-                    internode::shmem_ctx_quiet(ctx);
+                    if constexpr (multinode)        
+                        internode::shmem_ctx_quiet(ctx);
 #endif
                 }
-#endif //0
+
             }
         }
 
         // Put finishing flag
         // EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
 #ifdef USE_ROCM
-        // if (lane_id == 0){
-        // volatile int ret = __hip_atomic_fetch_add(
-        //     &sync_large_warp_counters[warp_group_id], 1,
-        //     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-        // }
-        // syncwarp();
-        // while (sync_large_warp_counters[warp_group_id] < (kNumWarpsPerGroup));
         __syncthreads();
 #else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
@@ -619,10 +595,15 @@ combine(void* combined_x,
             if (dst_rank != rank) {
 #ifdef USE_ROCM
 #if defined(ROCM_DISABLE_CTX)
-                //internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
+            if constexpr (multinode){ // does disabled CTX depend on multinode?
+                internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
+            }else{
                 rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
+            }
 #else
-                internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_flag + global_expert_idx, 1, dst_rank);
+                if constexpr (multinode){
+                    internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_flag + global_expert_idx, 1, dst_rank);
+                }
 #endif
 #else
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_flag + global_expert_idx, 1, dst_rank, local_expert_idx);
@@ -632,26 +613,33 @@ combine(void* combined_x,
             }
             atomic_add_relaxed_global(atomic_clean_flag, -1);
         }
-        //syncwarp();
     }
 
     // Receiving phase
     LOW_LATENCY_COMBINE_RECV:
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
+        if constexpr (multinode)
+            #if defined(USE_ROCM) && !defined(ROCM_DISABLE_CTX) && defined(multinode)
+                    internode::shmem_wg_ctx_destroy(&ctx);
+            #endif
         return;
 
     // Wait all ranks to arrive and notify PCIe usage
     if (responsible_expert_idx < num_experts) {
         // EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0){
-            while (ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
+            if constexpr (multinode){
+                while (ld_acquire_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
+            }else{
+                while (ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
+            }
         }
     }
-    grid_barrier(global_atomic_counter, num_sms, 1);
+    grid_barrier(global_atomic_counter, num_sms);
 
     // Reduce tokens with FP8 cast
-    // EP_DEVICE_ASSERT(num_topk <= kWarpSize and hidden_bf16_int4 <= num_threads);
-    // EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumElemsPerInt4) == 0, "Invalid vectorization");
+    EP_DEVICE_ASSERT(num_topk <= kWarpSize and hidden_bf16_int4 <= num_threads);
+    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumElemsPerInt4) == 0, "Invalid vectorization");
     if (thread_id < hidden_bf16_int4) {
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
             // Read top-k indices and weights
@@ -688,7 +676,9 @@ combine(void* combined_x,
         }
     }
 #if !defined(ROCM_DISABLE_CTX)
-    internode::shmem_wg_ctx_destroy(&ctx);
+    if constexpr (multinode) {
+        internode::shmem_wg_ctx_destroy(&ctx);
+    }
 #endif
 }
 
@@ -718,9 +708,10 @@ void combine(void* combined_x,
     auto atomic_clean_flag = reinterpret_cast<int*>(workspace);
     EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
-
+    bool multinode = (num_ranks > 8);
 #define COMBINE_LAUNCH_CASE(hidden) { \
-auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
+auto combine_func = multinode ? combine<true, kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>: \
+                                combine<false, kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
 LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, combine_func, \
               combined_x, \
               rdma_recv_x, rdma_recv_flag, rdma_send_x, \

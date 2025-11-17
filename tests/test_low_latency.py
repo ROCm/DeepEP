@@ -162,12 +162,12 @@ def test_loop(local_rank: int, num_local_ranks: int):
                             num_qps_per_rank=num_experts // num_ranks)
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=1)
 
-    do_pressure_test = True
-    for seed in range(int(10) if do_pressure_test else 0):
+    do_pressure_test = False
+    for seed in range(int(1e9) if do_pressure_test else 0):
         if local_rank == 0:
             print(f'Testing with seed {seed} ...', flush=True)
         ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed)
-        for i in range(2):
+        for i in range(20):
             assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
 
 
