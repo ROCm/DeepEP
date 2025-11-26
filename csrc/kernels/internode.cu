@@ -11,6 +11,16 @@ namespace internode {
 
 extern shmem_team_t cpu_rdma_team;
 
+// pseudo ramdom number delay
+__device__ __forceinline__ void pseudo_random_sleep() {    
+    auto seed = clock64();
+    auto r = seed * 1664525u + 1013904223u;
+    int delay = (r & 0x3FF);  // 0–1023 cycles
+    for (int i = 0; i < delay; ++i) {
+       __builtin_amdgcn_s_sleep(0); // optional (NOP on many chips)
+    }
+}
+
 template<int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
 __global__ void __launch_bounds__(kNumThreads, 1)
 get_dispatch_layout(const int64_t* topk_idx,
@@ -1942,6 +1952,8 @@ combine(int4* combined_x, float* combined_topk_weights,
             lane_id < kNumRDMARanks ? (rdma_receiver_rdma_head[warp_id][lane_id] = 0) : 0;
             lane_id == 0 ? (rdma_receiver_retired[warp_id] = false) : 0;
             sync_rdma_receiver_smem();
+
+            pseudo_random_sleep();
 
             // The same tokens as the dispatch process
             int token_start_idx, token_end_idx;
