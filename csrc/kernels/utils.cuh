@@ -221,6 +221,15 @@ __device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t *ptr) {
 #endif
     return ret;
 }
+__device__ __forceinline__ uint64_t ld_acquire_sys_global(const int64_t *ptr) {
+    int64_t ret;
+#ifdef USE_ROCM
+    ret = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+#endif
+    return ret;
+}
 //inter
 __device__ __forceinline__ int ld_acquire_global(const int *ptr) {
     int ret;
@@ -231,19 +240,32 @@ __device__ __forceinline__ int ld_acquire_global(const int *ptr) {
 #endif
     return ret;
 }
-//not used
-__device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int value) {
-    int ret;
-#ifndef USE_ROCM
-    asm volatile("atom.add.release.sys.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
+__device__ __forceinline__ int ld_acquire_global(const int64_t *ptr) {
+    int64_t ret;
+#ifdef USE_ROCM
+    ret = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+#else    
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
 #endif
     return ret;
 }
-//inter
+//not used
+
 __device__ __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
     int ret;
 #ifdef USE_ROCM
     ret = __hip_atomic_fetch_add(const_cast<int*> (ptr), value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
+#endif
+return ret;
+}
+
+//inter
+__device__ __forceinline__ int atomic_add_relaxed_global(const int* ptr, int value) {
+    int ret;
+#ifdef USE_ROCM
+    ret = __hip_atomic_fetch_add(const_cast<int*> (ptr), value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 #else
     asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
 #endif
