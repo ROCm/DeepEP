@@ -46,7 +46,7 @@ do { \
 do { \
     if (not (cond)) { \
         printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
-        trap(); \
+        abort();\
     } \
 } while (0)
 #else
