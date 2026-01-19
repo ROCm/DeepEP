@@ -18,12 +18,13 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto lane_id = thread_id % kWarpSize, warp_id = thread_id / kWarpSize, num_warps = num_threads / kWarpSize;
-
+        
     if (sm_id == 0) {
         // Barrier first
         barrier_device<kNumRanks>(task_fifo_ptrs, head, rank);
         move_fifo_slots<kNumRanks>(head);
         __syncthreads();
+
 
         int *per_rank_buffer, *per_expert_buffer;
         if (thread_id < kNumRanks) {
@@ -36,9 +37,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
         //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i to local expert j
         int num_experts_per_rank = num_experts / kNumRanks;
         if (thread_id < kNumRanks) {
-            #pragma unroll
-            for (int i = 0; i < kNumRanks; ++ i)
-                per_rank_buffer[rank * kNumRanks + i] = num_tokens_per_rank[i];
+            per_rank_buffer[rank * kNumRanks + thread_id] = num_tokens_per_rank[thread_id];
             #pragma unroll
             for (int i = 0; i < num_experts_per_rank; ++ i)
                 per_expert_buffer[rank * num_experts_per_rank + i] = num_tokens_per_expert[thread_id * num_experts_per_rank + i];
@@ -112,24 +111,38 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
     }
 }
 
-void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
-                     const int* num_tokens_per_expert, int* moe_recv_expert_counter_mapped, int num_experts,
-                     int num_tokens, const bool* is_token_in_rank, int* channel_prefix_matrix,
-                     int* rank_prefix_matrix_copy, int num_memset_int, int expert_alignment,
-                     void** buffer_ptrs, int **task_fifo_ptrs, int head, int rank,
-                     cudaStream_t stream, int num_channels) {
+void notify_dispatch(const int* num_tokens_per_rank,
+                     int* moe_recv_counter_mapped,
+                     int num_ranks,
+                     const int* num_tokens_per_expert,
+                     int* moe_recv_expert_counter_mapped,
+                     int num_experts,
+                     int num_tokens,
+                     const bool* is_token_in_rank,
+                     int* channel_prefix_matrix,
+                     int* rank_prefix_matrix_copy,
+                     int num_memset_int,
+                     int expert_alignment,
+                     void** buffer_ptrs,
+                     int** barrier_signal_ptrs,
+                     int rank,
+                     cudaStream_t stream,
+                     int num_channels,
+                     int head=0) {
+
 #define NOTIFY_DISPATCH_LAUNCH_CASE(ranks) \
     LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, notify_dispatch<ranks>, \
         num_tokens_per_rank, moe_recv_counter_mapped, \
         num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts, \
         num_tokens, num_channels, is_token_in_rank, channel_prefix_matrix, \
         rank_prefix_matrix_copy, num_memset_int, expert_alignment, \
-        buffer_ptrs, task_fifo_ptrs, head, rank); \
+        buffer_ptrs, barrier_signal_ptrs, head, rank); \
     break
 
     constexpr int kNumThreads = 128;
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(num_experts / num_ranks <= kNumThreads and num_ranks <= kNumThreads);
+
 
     SETUP_LAUNCH_CONFIG(1 + num_ranks, kNumThreads, stream);
     SWITCH_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE);
@@ -177,7 +190,7 @@ cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
 
 void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
                             void** buffer_ptrs, int** task_fifo_ptrs,
-                            int head, int rank, int num_ranks, cudaStream_t stream) {
+                            int rank, int num_ranks, cudaStream_t stream, int head=0) {
 #define CACHED_NOTIFY_DISPATCH_LAUNCH_CASE(ranks) \
     LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, cached_notify_dispatch<ranks>, \
         rank_prefix_matrix, num_memset_int, buffer_ptrs, task_fifo_ptrs, head, rank); \
@@ -493,12 +506,36 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
     }
 }
 
-void dispatch(void* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
-              int* send_head, const void* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
-              const bool* is_token_in_rank, const int* channel_prefix_matrix,
-              int num_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales,
-              void** buffer_ptrs, int rank, int num_ranks,
-              cudaStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens) {
+
+void dispatch(void* recv_x,
+              float* recv_x_scales,
+              int* recv_src_idx,
+              topk_idx_t* recv_topk_idx,
+              float* recv_topk_weights,
+              int* recv_channel_offset,
+              int* send_head,
+              const void* x,
+              const float* x_scales,
+              const topk_idx_t* topk_idx,
+              const float* topk_weights,
+              const bool* is_token_in_rank,
+              const int* channel_prefix_matrix,
+              int num_tokens,
+              int num_worst_tokens,//
+              int hidden_int4,
+              int num_topk,
+              int num_experts,
+              int num_scales,
+              int scale_token_stride,//
+              int scale_hidden_stride,//
+              void** buffer_ptrs,
+              int rank,
+              int num_ranks,
+              cudaStream_t stream,
+              int num_sms,
+              int num_max_send_tokens,
+              int num_recv_buffer_tokens)
+{
     constexpr int kNumThreads = (kWarpSize == 64 ? 1024 : 512);
 
 #define DISPATCH_LAUNCH_CASE(ranks) \
@@ -574,8 +611,8 @@ cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int 
 
 void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels,
                            int num_recv_tokens, int num_memset_int,
-                           int** task_fifo_ptrs, int head, int rank, int num_ranks,
-                           cudaStream_t stream) {
+                           int** task_fifo_ptrs, int rank, int num_ranks,
+                           cudaStream_t stream, int head = 0 ) {
 #define CACHED_NOTIFY_COMBINE(ranks) \
     LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, cached_notify_combine<ranks>, \
         buffer_ptrs, send_head, num_channels, num_recv_tokens, num_memset_int, task_fifo_ptrs, head, rank); \
@@ -605,13 +642,13 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
     const auto num_channels = num_sms / 2;
     const bool is_sender = sm_id % 2 == 0;
     const int responsible_channel = sm_id / 2;
+
     EP_DEVICE_ASSERT(num_topk <= kWarpSize);
 
     constexpr int kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
     int hidden_int4 = hidden * sizeof(dtype_t) / sizeof(int4);
     auto x_int4 = reinterpret_cast<const int4*>(x);
     auto recv_int4 = reinterpret_cast<int4*>(recv_x);
-
     if (is_sender) {
         // Workers for sending
         // Several warps are responsible for a single rank
@@ -867,13 +904,25 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 }
 
 void combine(cudaDataType_t type,
-             void* recv_x, float* recv_topk_weights,
-             const void* x, const float* topk_weights,
-             const int* src_idx, const int* rank_prefix_matrix, const int* channel_prefix_matrix,
-             int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
-             void** buffer_ptrs, int rank, int num_ranks,
-             cudaStream_t stream, int num_sms,
-             int num_max_send_tokens, int num_recv_buffer_tokens) {
+             void* recv_x,
+             float* recv_topk_weights,
+             const void* x,
+             const float* topk_weights,
+             const int* src_idx,
+             const int* rank_prefix_matrix,
+             const int* channel_prefix_matrix,
+             int* send_head,
+             int num_tokens,
+             int num_recv_tokens,
+             int hidden,
+             int num_topk,
+             void** buffer_ptrs,
+             int rank,
+             int num_ranks,
+             cudaStream_t stream,
+             int num_sms,
+             int num_max_send_tokens,
+             int num_recv_buffer_tokens) {
     constexpr int kNumThreads = kWarpSize == 64 ? 1024 : 768;
 
 #define COMBINE_LAUNCH_CASE(dtype, ranks) \
