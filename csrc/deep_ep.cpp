@@ -36,7 +36,7 @@ Buffer::Buffer(int rank,
     // Common checks
     EP_STATIC_ASSERT(NUM_BUFFER_ALIGNMENT_BYTES % sizeof(int4) == 0, "Invalid alignment");
     EP_HOST_ASSERT(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
-                   (num_nvl_bytes <= std::numeric_limits<int>::max() or num_rdma_bytes == 0));
+                   (num_nvl_bytes <= std::numeric_limits<int64_t>::max() or num_rdma_bytes == 0));
     EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
                    (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int>::max()));
     EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int>::max());
@@ -396,7 +396,6 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            bool async,
                            bool allocate_on_comm_stream) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
-
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
