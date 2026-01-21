@@ -317,8 +317,8 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             for (int i = 0; i < num_nvl_experts; ++ i)
                 nvl_send_num_tokens_per_expert.buffer(nvl_rank)[i] = nvl_reduced_num_tokens_per_expert[thread_id * num_nvl_experts + i];
         }
-        memory_fence();
-        __syncthreads();
+        // memory_fence();
+        // __syncthreads();
         barrier_device<NUM_MAX_NVL_PEERS>(task_fifo_ptrs, head, nvl_rank);
         move_fifo_slots<NUM_MAX_NVL_PEERS>(head);
         __syncthreads();
@@ -619,11 +619,11 @@ asm volatile(
                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank,
                                                          nvl_rank));
         }
-#if defined(ROCM_DISABLE_CTX)
-        shmem_fence();
-#else
-        shmem_ctx_quiet(ctx);
-#endif
+// #if defined(ROCM_DISABLE_CTX)
+//         shmem_fence();
+// #else
+//         shmem_ctx_quiet(ctx);
+// #endif
         sync_rdma_sender_smem();
 
         // Iterate over tokens and copy into buffer
@@ -970,14 +970,26 @@ asm volatile(
 
             // Move tail index
             syncwarp();
-            if (lane_id == 0)
+            if (lane_id == 0) 
                 st_relaxed_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+
         }
 
         // Retired
         syncwarp();
-        if (lane_id == 0)
-            forward_channel_retired[dst_nvl_rank] = true;
+        if (lane_id == 0){
+#ifdef USE_ROCM
+                // Ensure all prior memory operations are visible to all threads.
+                // This is necessary to guarantee that payload writes are completed before the flag is updated.
+                __atomic_signal_fence(__ATOMIC_SEQ_CST);
+                __builtin_amdgcn_s_waitcnt(0);
+                __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#else
+                st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+#endif
+            }
+    
+    
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
         // Extra warps for forwarder coordinator should exit directly
         if (target_rank > 0)
@@ -1573,8 +1585,17 @@ combine(int4* combined_x, float* combined_topk_weights,
 
             // Move queue tail
             syncwarp();
-            if (lane_id < kNumRDMARanks and is_lane_ready)
-                st_relaxed_sys_global(nvl_channel_tail.buffer() + lane_id, cached_channel_tail_idx);
+            if (lane_id < kNumRDMARanks and is_lane_ready){
+#ifdef USE_ROCM
+                // Ensure all prior memory operations are visible to all threads.
+                // This is necessary to guarantee that payload writes are completed before the flag is updated.
+                __atomic_signal_fence(__ATOMIC_SEQ_CST);
+                __builtin_amdgcn_s_waitcnt(0);
+                __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#else
+                st_release_sys_global(nvl_channel_tail.buffer() + lane_id, cached_channel_tail_idx);
+#endif
+            }
         }
     } else {
         auto lane_id = get_lane_id() % kWarpHyb;
@@ -1815,11 +1836,7 @@ combine(int4* combined_x, float* combined_topk_weights,
                         }
 #endif
 
-#if defined(ROCM_DISABLE_CTX)
-                        shmem_fence();
-#else
-                        shmem_ctx_quiet(ctx);
-#endif
+
                     } else {
                         memory_fence();
                     }
