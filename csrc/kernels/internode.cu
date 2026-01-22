@@ -174,12 +174,12 @@ int get_source_meta_bytes() {
 }
 
 __host__ __device__ __forceinline__
-int get_num_bytes_per_rdma_token(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
+int64_t get_num_bytes_per_rdma_token(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
     return static_cast<int>(align(hidden_int4 * sizeof(int4) + sizeof(SourceMeta) + num_scales * sizeof(float) + num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float), sizeof(int4)));
 }
 
 __host__ __device__ __forceinline__
-std::pair<int, int> get_rdma_clean_meta(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights, int num_rdma_ranks, int num_rdma_recv_buffer_tokens, int num_sms) {
+std::pair<int64_t, int64_t> get_rdma_clean_meta(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights, int num_rdma_ranks, int num_rdma_recv_buffer_tokens, int num_sms) {
     // Return `int32_t` offset and count to clean
     return {
         (get_num_bytes_per_rdma_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_rdma_recv_buffer_tokens * num_rdma_ranks * 2 * num_sms) / sizeof(int),
@@ -485,7 +485,9 @@ void notify_dispatch(const int* num_tokens_per_rank,
 
     // Get clean meta
     auto rdma_clean_meta = get_rdma_clean_meta(hidden_int4, num_scales, num_topk, num_topk, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
+
     auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4, num_scales, num_topk, num_topk, num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens, num_channels);
+
 #ifdef USE_ROCM
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= static_cast<size_t>(num_rdma_bytes));
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= static_cast<size_t>(num_nvl_bytes));
@@ -495,13 +497,8 @@ void notify_dispatch(const int* num_tokens_per_rank,
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= num_rdma_bytes);
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
     EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
-<<<<<<< HEAD
     EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
 #endif
-
-=======
-    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int64_t>::max());
->>>>>>> b763e9d (enable 64 SMs on MI300)
 
     // Launch kernel
     SETUP_LAUNCH_CONFIG(1 + num_rdma_ranks, kNumThreads, stream);
@@ -1321,7 +1318,6 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
         EP_DEVICE_ASSERT(num_rdma_ranks <= kWarpSize);
 
         // Iterate in reverse order
-<<<<<<< HEAD
 #ifndef USE_ROCM
         int kwarp_id = warp_id;
 #else
@@ -1329,14 +1325,6 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
             int kwarp_id = channel_id + warp_id;
 #endif
         if (lane_id < num_rdma_ranks and kwarp_id < num_channels) {
-=======
-#ifdef USE_ROCM
-        int remain_warp_id = warp_id;
-        for (int i = 0; i < num_channels; i += num_warps) {
-            warp_id = i * num_warps + remain_warp_id;
-#endif
-        if (lane_id < num_rdma_ranks and warp_id < num_channels) {
->>>>>>> b763e9d (enable 64 SMs on MI300)
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_combined_tokens, num_channels, kwarp_id, token_start_idx, token_end_idx);
 
@@ -1362,7 +1350,6 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
 #endif
         EP_DEVICE_ASSERT(rdma_channel_prefix_matrix != nullptr and rdma_rank_prefix_sum != nullptr);
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= kWarpSize, "Too many NVL peers");
-<<<<<<< HEAD
 #ifndef USE_ROCM
         int kwarp_id = warp_id;
 #else
@@ -1390,34 +1377,6 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
                 }
             }
         }
-=======
-#ifdef USE_ROCM
-        int remain_warp_id = warp_id;
-        for (int i = 0; i < num_channels; i += num_warps) {
-            warp_id = i * num_warps + remain_warp_id;
-#endif
-            if (lane_id < NUM_MAX_NVL_PEERS and warp_id < num_channels) {
-                for (int dst_rdma_rank = sm_id - 3; dst_rdma_rank < num_rdma_ranks; dst_rdma_rank += num_channels * 2 - 3) {
-                    // Iterate in reverse order
-                    int token_start_idx = warp_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id - 1];
-                    int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id];
-                    int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
-                    token_start_idx += shift, token_end_idx += shift;
-
-                    // NOTES: `1 << 25` is a heuristic large number
-                    int last_head = 1 << 25;
-                    #pragma unroll
-                    for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; -- token_idx)  {
-                        auto current_head = __ldg(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
-                        if (current_head < 0) {
-                            combined_nvl_head[token_idx * NUM_MAX_NVL_PEERS + lane_id] = -last_head - 1;
-                        } else {
-                            last_head = current_head;
-                        }
-                    }
-                }
-            }
->>>>>>> b763e9d (enable 64 SMs on MI300)
 #ifdef USE_ROCM
     }
 #endif
@@ -1466,15 +1425,10 @@ void cached_notify(int hidden_int4,
 #else
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= num_rdma_bytes);
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
-<<<<<<< HEAD
     EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
 #endif
 
-=======
-    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int64_t>::max());
-    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int64_t>::max());
->>>>>>> b763e9d (enable 64 SMs on MI300)
     EP_HOST_ASSERT(num_channels * 2 > 3);
 
     // Launch kernel

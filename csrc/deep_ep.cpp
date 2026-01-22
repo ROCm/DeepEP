@@ -38,9 +38,9 @@ Buffer::Buffer(int rank,
     EP_HOST_ASSERT(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
                    (num_nvl_bytes <= std::numeric_limits<int64_t>::max() or num_rdma_bytes == 0));
     EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
-                   (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int>::max()));
-    EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int>::max());
-    EP_HOST_ASSERT(num_rdma_bytes / sizeof(int4) < std::numeric_limits<int>::max());
+                   (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int64_t>::max()));
+    EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int64_t>::max());
+    EP_HOST_ASSERT(num_rdma_bytes / sizeof(int4) < std::numeric_limits<int64_t>::max());
     EP_HOST_ASSERT(0 <= rank and rank < num_ranks and (num_ranks <= NUM_MAX_NVL_PEERS * NUM_MAX_RDMA_PEERS or low_latency_mode));
     EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
     if (num_rdma_bytes > 0)
@@ -85,7 +85,6 @@ Buffer::Buffer(int rank,
         // No need to synchronize, will do a full device sync during `sync`
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
     }
-
     // Create 32 MiB workspace
 #ifdef USE_ROCM
     CUDA_CHECK(hipExtMallocWithFlags(&workspace, NUM_WORKSPACE_BYTES, hipDeviceMallocUncached));
@@ -873,6 +872,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     // unless we release GIL here.
     pybind11::gil_scoped_release release;
 
+
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     EP_HOST_ASSERT(0 < get_num_rdma_ranks() and get_num_rdma_ranks() <= NUM_MAX_RDMA_PEERS);
@@ -928,6 +928,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1)),
          hidden_int4 = static_cast<int>(x.size(1) * x.element_size() / sizeof(int4));
     auto num_experts = cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->size(0)), num_local_experts = num_experts / num_ranks;
+    //printf(" buffer size get rdma %lld\n",config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks));
 
     // Top-k checks
     int num_topk = 0;
@@ -1011,7 +1012,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  barrier_signal_ptrs_gpu,
                                  rank,
                                  comm_stream,
-                                 config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+                                 num_rdma_bytes,
                                  num_nvl_bytes,
                                  true,
                                  low_latency_mode);
@@ -1052,7 +1053,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    barrier_signal_ptrs_gpu,
                                    rank,
                                    comm_stream,
-                                   config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+                                   num_rdma_bytes,
                                    num_nvl_bytes,
                                    low_latency_mode);
         move_fifo_slots(3);
@@ -1322,7 +1323,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              barrier_signal_ptrs_gpu,
                              rank,
                              comm_stream,
-                             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+                             num_rdma_bytes,
                              num_nvl_bytes,
                              false,
                              low_latency_mode);
