@@ -341,7 +341,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
            nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
 #endif
         } else {
-            st_na_release(reinterpret_cast<int *>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank), -num_tokens_sent - 1);
+            st_na_release(reinterpret_cast<int64_t *>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank), -num_tokens_sent - 1);
         }
 #if defined(NIC_IO) || defined(NIC_THOR2)
      if constexpr (kMultinode){
@@ -365,14 +365,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
     // Receiving phase
     LOW_LATENCY_DISPATCH_RECV:
-    if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
-#if defined(USE_ROCM) && !defined(ROCM_DISABLE_CTX)
+    if ((phases & LOW_LATENCY_RECV_PHASE) == 0){
+#if !defined(ROCM_DISABLE_CTX)
         if constexpr (kMultinode)
             internode::shmem_wg_ctx_destroy(&ctx);
 #endif
         return;
     }
-
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
     if (phases & LOW_LATENCY_SEND_PHASE){
         grid_barrier(global_atomic_counter, num_sms);
@@ -401,14 +400,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             auto start_time = clock64();
             if constexpr (kMultinode){
                 while ((num_recv_tokens = ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
-                     if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
-                         printf("dispatch recieve time out \n");
+                    if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
+                        printf("dispatch recieve time out \\n");
                     }
                 }
             }else{
                 while ((num_recv_tokens = ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
-                         if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
-                         printf("dispatch recieve single node time out \n");
+                    if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
+                        printf("dispatch recieve single node time out \\n");
                     }
                 }
             }
@@ -459,6 +458,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 #endif
 }
 
+
 void dispatch(void* packed_recv_x,
               float* packed_recv_x_scales,
               int* packed_recv_src_info,
@@ -488,7 +488,7 @@ void dispatch(void* packed_recv_x,
               int num_device_sms,
               cudaStream_t stream,
               int phases,
-              int* global_atomic_counter = NULL) {
+              int* global_atomic_counter) {
 
 #ifdef USE_ROCM
     constexpr int kNumWarpsPerGroup = 8;
@@ -509,6 +509,10 @@ void dispatch(void* packed_recv_x,
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
 
+    static_assert(sizeof(topk_idx_t) == sizeof(int64_t),
+                  "internode_ll::dispatch requires 64-bit topk indices");
+    const int64_t* topk_idx_64 = reinterpret_cast<const int64_t*>(topk_idx);
+
     bool kMultinode = (num_ranks > 8);
 #define DISPATCH_LAUNCH_CASE(hidden) { \
   auto dispatch_func =                                                                      \
@@ -525,7 +529,7 @@ LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, dispatch_func, \
               packed_recv_count, \
               global_atomic_counter, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
-              x, topk_idx, \
+              x, topk_idx_64, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean, num_next_clean_int, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
@@ -646,6 +650,7 @@ combine(void* combined_x,
                     internode::shmem_ctx_quiet(ctx);
 #endif
                 }
+            }
         }
 
         // Put finishing flag
@@ -677,7 +682,7 @@ combine(void* combined_x,
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_flag + global_expert_idx, 1, dst_rank, local_expert_idx);
 #endif //USE_ROCM
             } else {
-                st_na_release(reinterpret_cast<int*>(rdma_recv_flag + global_expert_idx), 1);
+                st_na_release(reinterpret_cast<int64_t*>(rdma_recv_flag + global_expert_idx), 1);
             }
             atomic_add_relaxed_global(atomic_clean_flag, -1);
                 if constexpr (kMultinode){
@@ -785,6 +790,7 @@ void combine(void* combined_x,
              int phases,
              bool zero_copy,
              int* global_atomic_counter = NULL) {
+
 #ifdef USE_ROCM
     constexpr int kNumWarpsPerGroup = 8;
     constexpr int kNumWarpGroups = 2;

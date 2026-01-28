@@ -596,6 +596,15 @@ __device__ __forceinline__ void st_na_release(const uint32_t *ptr, uint32_t val)
 #endif
 }
 
+__device__ __forceinline__ void st_na_release(const int64_t *ptr, int64_t val) {
+#ifdef USE_ROCM
+    int64_t* non_const_ptr = const_cast<int64_t*>(ptr);
+    __hip_atomic_store(non_const_ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    asm volatile("st.release.gpu.global.L1::no_allocate.b64 [%0], %1;" : : "l"(ptr), "l"(val));
+#endif
+}
+
 __device__ __forceinline__ void st_na_release(const uint64_t *ptr, uint64_t val) {
 #ifdef USE_ROCM
     uint64_t* non_const_ptr = const_cast<uint64_t*>(ptr);
@@ -844,6 +853,4 @@ template <typename dtype_t>
 __host__ __device__ constexpr dtype_t align_down(dtype_t a, dtype_t b) {
     return a / b * b;
 }
-
-
 

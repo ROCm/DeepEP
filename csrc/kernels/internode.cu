@@ -488,6 +488,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
 
     auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4, num_scales, num_topk, num_topk, num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens, num_channels);
 
+
 #ifdef USE_ROCM
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= static_cast<size_t>(num_rdma_bytes));
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= static_cast<size_t>(num_nvl_bytes));

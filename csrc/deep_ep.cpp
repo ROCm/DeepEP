@@ -557,7 +557,6 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
                 if (ready)
                     break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(5000)); 
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
                     NUM_CPU_TIMEOUT_SECS)
@@ -1012,7 +1011,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  barrier_signal_ptrs_gpu,
                                  rank,
                                  comm_stream,
-                                 num_rdma_bytes,
+                                 config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                  num_nvl_bytes,
                                  true,
                                  low_latency_mode);
@@ -1053,7 +1052,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    barrier_signal_ptrs_gpu,
                                    rank,
                                    comm_stream,
-                                   num_rdma_bytes,
+                                   config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                    num_nvl_bytes,
                                    low_latency_mode);
         move_fifo_slots(3);
@@ -1491,14 +1490,15 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
-    auto global_atomic_counter = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-	    
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
+#ifdef USE_ROCM
+    cudaMemsetAsync(dispatch_global_atomic_counter, 0, sizeof(int), launch_stream);
+#endif
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
@@ -1567,8 +1567,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             workspace,
             num_device_sms,
             launch_stream,
-            phases,
-            global_atomic_counter.data_ptr<int>());
+            phases
+#ifdef USE_ROCM
+            ,dispatch_global_atomic_counter
+#endif
+        );
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
@@ -1638,7 +1641,6 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     auto hidden = static_cast<int>(x.size(2));
     auto num_topk = static_cast<int>(topk_weights.size(1));
     auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
-    auto global_atomic_counter = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
 
     // Buffer control
@@ -1652,6 +1654,9 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
+#ifdef USE_ROCM
+    cudaMemsetAsync(combine_global_atomic_counter, 0, sizeof(int), launch_stream);
+#endif
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
@@ -1694,8 +1699,11 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
                               num_device_sms,
                               launch_stream,
                               phases,
-                              zero_copy,
-                              global_atomic_counter.data_ptr<int>());
+                              zero_copy
+#ifdef USE_ROCM
+                              ,combine_global_atomic_counter
+#endif
+                            );
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
