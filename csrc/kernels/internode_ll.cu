@@ -8,7 +8,7 @@
 #include <rocshmem/rocshmem.hpp>
 #include <iostream>
 // low latency+RocSHMEM has issue with CTX.
-#if defined(NIC_CX7)
+#if defined(NIC_IO) || defined(NIC_CX7)
   #define ROCM_DISABLE_CTX
 #endif
 
@@ -331,6 +331,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
            if constexpr (!kMultinode){
                 rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
             }else{
+                __threadfence_system();
 #if defined(ROCM_DISABLE_CTX)
                 internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
 #else
@@ -643,14 +644,17 @@ combine(void* combined_x,
                     internode::shmem_ctx_schar_put_nbi_warp(ctx,reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
 #endif
                 }
-                if constexpr (kMultinode){
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmem_fence();
-#else
-                    internode::shmem_ctx_quiet(ctx);
-#endif
-                }
+
             }
+        }
+
+        if constexpr (kMultinode){
+            if (sub_warp_id == 0)
+#if defined(ROCM_DISABLE_CTX)
+                internode::shmem_fence();
+#else
+                internode::shmem_ctx_quiet(ctx);
+#endif
         }
 
         // Put finishing flag
@@ -672,6 +676,7 @@ combine(void* combined_x,
                 if constexpr (!kMultinode){
                     rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
                 } else {
+                    __threadfence_system();
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #else
@@ -685,13 +690,13 @@ combine(void* combined_x,
                 st_na_release(reinterpret_cast<int64_t*>(rdma_recv_flag + global_expert_idx), 1);
             }
             atomic_add_relaxed_global(atomic_clean_flag, -1);
-                if constexpr (kMultinode){
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmem_fence();
-#else
-                    internode::shmem_ctx_quiet(ctx);
-#endif
-                }
+//                 if constexpr (kMultinode){
+// #if defined(ROCM_DISABLE_CTX)
+//                     internode::shmem_fence();
+// #else
+//                     internode::shmem_ctx_quiet(ctx);
+// #endif
+//                 }
 
         }
     }
