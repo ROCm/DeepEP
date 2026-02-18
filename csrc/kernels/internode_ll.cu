@@ -461,7 +461,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
 
 void dispatch(void* packed_recv_x,
-              float* packed_recv_x_scales,
+              void*  packed_recv_x_scales,
               int* packed_recv_src_info,
               int64_t* packed_recv_layout_range,
               int* packed_recv_count,
@@ -516,14 +516,30 @@ void dispatch(void* packed_recv_x,
 
     bool kMultinode = (num_ranks > 8);
 #define DISPATCH_LAUNCH_CASE(hidden) { \
-  auto dispatch_func =                                                                      \
-    use_fp8                                                                                 \
-      ? ( kMultinode                                                                          \
-            ? dispatch<true,  true,  kNumWarpGroups, kNumWarpsPerGroup, hidden>            \
-            : dispatch<true,  false, kNumWarpGroups, kNumWarpsPerGroup, hidden> )          \
-      : ( kMultinode                                                                          \
-            ? dispatch<false, true,  kNumWarpGroups, kNumWarpsPerGroup, hidden>            \
-            : dispatch<false, false, kNumWarpGroups, kNumWarpsPerGroup, hidden> );\
+auto dispatch_func =   \
+  use_fp8   \
+    ? ( use_ue8m0   \
+          ? ( round_scale   \
+                ? ( kMultinode    \
+                      ? dispatch<true,  true,  true,  \
+                                 kNumWarpGroups, kNumWarpsPerGroup, hidden>   \
+                      : dispatch<true,  true,  false, \
+                                 kNumWarpGroups, kNumWarpsPerGroup, hidden> ) \
+                : ( kMultinode    \
+                      ? dispatch<true,  false, true,  \
+                                 kNumWarpGroups, kNumWarpsPerGroup, hidden>   \
+                      : dispatch<true,  false, false, \
+                                 kNumWarpGroups, kNumWarpsPerGroup, hidden> ) ) \
+          : ( kMultinode    \
+                ? dispatch<true,  false, true,  \
+                           kNumWarpGroups, kNumWarpsPerGroup, hidden>   \
+                : dispatch<true,  false, false, \
+                           kNumWarpGroups, kNumWarpsPerGroup, hidden> ) )   \
+    : ( kMultinode  \
+          ? dispatch<false, false, true,    \
+                     kNumWarpGroups, kNumWarpsPerGroup, hidden> \
+          : dispatch<false, false, false,   \
+                     kNumWarpGroups, kNumWarpsPerGroup, hidden> );  \
 LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
