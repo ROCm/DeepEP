@@ -795,6 +795,51 @@ barrier_device(int **task_fifo_ptrs, int head, int rank, int tag = 0) {
     timeout_check<kNumRanks>(task_fifo_ptrs, head, rank, 0, tag);
 }
 
+template <bool kIsUE8M0,
+          typename out_dtype_t = std::conditional_t<kIsUE8M0, uint8_t, float>>
+__forceinline__ __device__ out_dtype_t
+extract_required_scale_format(float value) {
+  if constexpr (kIsUE8M0) {
+    return static_cast<uint8_t>((*reinterpret_cast<uint32_t*>(&value)) >> 23);
+  } else {
+    return value;
+  }
+}
+
+#ifdef USE_ROCM 
+constexpr float kFP8Margin = 1e-4;
+constexpr float kFinfoAmaxE4M3 = 240.0f;
+constexpr float kFinfoAmaxInvE4M3 = 1 / 240.0f;
+#else
+constexpr float kFP8Margin = 1e-4;
+constexpr float kFinfoAmaxE4M3 = 448.0f;
+constexpr float kFinfoAmaxInvE4M3 = 1 / 448.0f;
+#endif
+
+__forceinline__ __device__ float fast_pow2(int x) {
+    // We can ensure `-126 <= x and x <= 127`
+    uint32_t bits_x = (x + 127) << 23;
+    return *reinterpret_cast<float*>(&bits_x);
+}
+
+__forceinline__ __device__ int fast_log2_ceil(float x) {
+    auto bits_x = *reinterpret_cast<uint32_t*>(&x);
+    auto exp_x = (bits_x >> 23) & 0xff;
+    auto man_bits = bits_x & ((1 << 23) - 1);
+    return exp_x - 127 + (man_bits != 0);
+}
+
+__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv, bool round_scale) {
+    if (round_scale) {
+        auto exp_scale_inv = fast_log2_ceil(amax * kFinfoAmaxInvE4M3);
+        scale = fast_pow2(-exp_scale_inv);
+        scale_inv = fast_pow2(exp_scale_inv);
+    } else {
+        
+        scale_inv = amax * kFinfoAmaxInvE4M3;
+        scale = kFinfoAmaxE4M3 / amax;
+    }
+}
 
 template <int kNumRanks, bool kSyncOnly = false>
 __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {

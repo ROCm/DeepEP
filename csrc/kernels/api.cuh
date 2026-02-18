@@ -273,7 +273,7 @@ void clean_low_latency_buffer(int64_t* clean_0,
                               cudaStream_t stream);
 
 void dispatch(void* packed_recv_x,
-              float* packed_recv_x_scales,
+              void* packed_recv_x_scales,
               int* packed_recv_src_info,
               int64_t* packed_recv_layout_range,
               int* packed_recv_count,

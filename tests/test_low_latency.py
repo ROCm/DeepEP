@@ -88,7 +88,7 @@ def test_main(num_tokens: int,
         for return_recv_hook in (False, True):
             for dispatch_use_fp8 in (False, True):
                 for round_scale in (False, True) if dispatch_use_fp8 else (False, ):
-                    for use_ue8m0 in (False,) if round_scale else (False, ):
+                    for use_ue8m0 in (False, True) if round_scale else (False, ):
                         if shrink_test and simulate_failure_and_skip(rank, "dispatch", expected_masked_ranks):
                             break
                         num_times += 1
