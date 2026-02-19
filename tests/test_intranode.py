@@ -5,7 +5,7 @@ import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
 import deep_ep
-from utils import init_dist, bench, calc_diff, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
+from utils import init_dist, bench, calc_diff, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, use_rocm
 
 # Test compatibility with low latency functions
 import test_low_latency
@@ -25,7 +25,10 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     # Random data
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    x_e4m3 = per_token_cast_to_fp8(x) if deep_ep.Buffer.is_sm90_compiled() else None
+    if use_rocm:
+        x_e4m3 = per_token_cast_to_fp8(x)
+    else:
+        x_e4m3 = per_token_cast_to_fp8(x) if deep_ep.Buffer.is_sm90_compiled() else None
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T) if x_e4m3 is not None else None
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
@@ -281,7 +284,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             use_fabric=args.use_fabric)
     torch.manual_seed(rank)
 
-    for i in (24, ):
+    if use_rocm:
+        num_sms = 64
+    else:
+        num_sms = 24
+
+    for i in (num_sms, ):
         test_main(args, i, local_rank, num_ranks, rank, buffer, group)
         if local_rank == 0:
             print('', flush=True)

@@ -11,15 +11,6 @@ namespace internode {
 
 extern shmem_team_t cpu_rdma_team;
 
-// pseudo ramdom number delay
-__device__ __forceinline__ void pseudo_random_sleep() {    
-    auto seed = clock64();
-    auto r = seed * 1664525u + 1013904223u;
-    int delay = (r & 0x3FF);  // 0–1023 cycles
-    for (int i = 0; i < delay; ++i) {
-       __builtin_amdgcn_s_sleep(0); // optional (NOP on many chips)
-    }
-}
 
 template<int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
 __global__ void __launch_bounds__(kNumThreads, 1)
@@ -229,21 +220,11 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
     auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     auto num_rdma_experts = num_experts / kNumRDMARanks, num_nvl_experts = num_rdma_experts / NUM_MAX_NVL_PEERS;
 
-// #if !defined(ROCM_DISABLE_CTX)
-//     __shared__ shmem_ctx_t ctx;
-//     shmem_wg_ctx_create(&ctx);
-// #endif
     if (sm_id == 0) {
         // Communication with others
         // Global barrier: the first warp do intra-node sync, the second warp do internode sync
         EP_DEVICE_ASSERT(num_warps > 1);
         EP_DEVICE_ASSERT(kNumRDMARanks <= num_threads);
-//         if (thread_id == kWarpSize)
-// #if defined(ROCM_DISABLE_CTX)
-//             internode::shmem_fence();
-// #else
-//             internode::shmem_ctx_quiet(ctx);
-// #endif
         if (thread_id == kWarpSize)
             nvshmem_barrier_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
 
@@ -367,11 +348,6 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         }
 
         // Finally barrier
-// #if defined(ROCM_DISABLE_CTX)
-//             internode::shmem_fence();
-// #else
-//             internode::shmem_ctx_quiet(ctx);
-// #endif
         __syncthreads();
         if (thread_id == kWarpSize)
             nvshmem_barrier_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
@@ -429,9 +405,6 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 prefix_row[i] += prefix_row[i - 1];
         }
     }
-// #if !defined(ROCM_DISABLE_CTX)
-//     shmem_wg_ctx_destroy(&ctx);
-// #endif
 }
 
 void notify_dispatch(const int* num_tokens_per_rank,
@@ -1976,8 +1949,6 @@ combine(int4* combined_x, float* combined_topk_weights,
             lane_id < kNumRDMARanks ? (rdma_receiver_rdma_head[warp_id][lane_id] = 0) : 0;
             lane_id == 0 ? (rdma_receiver_retired[warp_id] = false) : 0;
             sync_rdma_receiver_smem();
-
-            pseudo_random_sleep();
 
             // The same tokens as the dispatch process
             int token_start_idx, token_end_idx;

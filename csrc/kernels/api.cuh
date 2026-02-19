@@ -7,7 +7,6 @@ namespace deep_ep {
 // Intranode runtime
 namespace intranode {
 
-//void barrier(int **task_fifo_ptrs, int head, int rank, int num_ranks, cudaStream_t stream);
 void barrier(int **task_fifo_ptrs, int rank, int num_ranks, cudaStream_t stream, int head = 0);
 
 } // namespace intranode
@@ -100,8 +99,6 @@ void combine(cudaDataType_t type,
              float* recv_topk_weights,
              const void* x,
              const float* topk_weights,
-             //const void* bias_0,
-             //const void* bias_1,
              const int* src_idx,
              const int* rank_prefix_matrix,
              const int* channel_prefix_matrix,
@@ -300,8 +297,11 @@ void dispatch(void* packed_recv_x,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
-              int phases,
-              int* global_atomic_counter = NULL);
+              int phases
+#ifdef USE_ROCM
+              ,int* global_atomic_counter = nullptr
+#endif
+            );
 
 void combine(void* combined_x,
              void* rdma_recv_x,
@@ -328,8 +328,11 @@ void combine(void* combined_x,
              int num_device_sms,
              cudaStream_t stream,
              int phases,
-             bool zero_copy,
-             int* global_atomic_counter = NULL);
+             bool zero_copy
+#ifdef USE_ROCM
+              ,int* global_atomic_counter = nullptr
+#endif
+);
 
 void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
 

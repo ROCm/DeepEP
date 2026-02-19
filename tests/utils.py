@@ -10,6 +10,15 @@ import torch
 import torch.distributed as dist
 from typing import Optional, Union
 
+use_rocm = torch.version.hip is not None
+def get_rocm_gfx():
+
+    # Check ROCm build + GPU available
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return None
+
+    props = torch.cuda.get_device_properties(0)
+    return getattr(props, "gcnArchName", None)
 
 def init_dist(local_rank: int, num_local_ranks: int, backend: str = 'nccl'):
     # NOTES: you may rewrite this function with your own cluster settings
@@ -59,9 +68,14 @@ def per_token_cast_to_fp8(x: torch.Tensor):
     aligned_n = align_up(n, 128)
     x_padded = torch.nn.functional.pad(x, (0, aligned_n - n), mode='constant', value=0)
     x_padded_view = x_padded.view(m, -1, 128)
+    fp8_max = 448
+    fp8_dtype = torch.float8_e4m3fn
+    if ( "gfx942" in get_rocm_gfx()):
+        fp8_max = 240
+        fp8_dtype = torch.float8_e4m3fnuz
     x_amax = x_padded_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    return (x_padded_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
-        m, aligned_n)[:, :n].contiguous(), (x_amax / 448.0).view(m, -1)
+    return (x_padded_view * (fp8_max / x_amax.unsqueeze(2))).to(fp8_dtype).view(
+        m, aligned_n)[:, :n].contiguous(), (x_amax / fp8_max).view(m, -1)
 
 
 def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):

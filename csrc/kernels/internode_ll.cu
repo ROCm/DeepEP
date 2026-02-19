@@ -112,17 +112,21 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
 #if !defined(ROCM_DISABLE_CTX)
     __shared__ internode::shmem_ctx_t ctx;
     if constexpr (kMultinode)
-        EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0);
+        EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0 or ctx == ROCSHMEM_CTX_INVALID);
 #endif
 
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
 #ifdef USE_ROCM
+#if defined(__gfx942__)
     constexpr float kFP8Margin = 1e-4, kFP8Amax = 240, kFP8AmaxInv = 1.0f / 240.0f;
-    const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__hip_fp8_storage_t) : sizeof(gpu_bfloat16_t));
-#else
+#else //gfx950
     constexpr float kFP8Margin = 1e-4, kFP8Amax = 448, kFP8AmaxInv = 1.0f / 448.0f;
+#endif
     const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__hip_fp8_storage_t) : sizeof(gpu_bfloat16_t));
+#else //NV
+    constexpr float kFP8Margin = 1e-4, kFP8Amax = 448, kFP8AmaxInv = 1.0f / 448.0f;
+    const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(gpu_bfloat16_t));
 #endif
     const int num_scales = kHidden / kNumPerChannels;
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
@@ -454,13 +458,6 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
 
             // Copy scales
             if (kUseFP8) {
-                // const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
-                // const auto dst_scales = reinterpret_cast<float*>(recv_x_scales + recv_token_begin_idx + i);
-                // const auto scale_stride = num_ranks * num_max_dispatch_tokens_per_rank;
-                // auto scale_0 = lane_id < num_scales ? ld_nc_global(src_scales + lane_id) : 0;
-                // auto scale_1 = (lane_id + kWarpSize) < num_scales ? ld_nc_global(src_scales + lane_id + kWarpSize) : 0;
-                // lane_id < num_scales ? dst_scales[lane_id * scale_stride] = scale_0 : 0.0f;
-                // (lane_id + kWarpSize) < num_scales ? dst_scales[(lane_id + kWarpSize) * scale_stride] = scale_1 : 0.0f;
                 const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
                 const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
                 const auto token_idx = recv_token_begin_idx + i;
@@ -542,13 +539,6 @@ void dispatch(void* packed_recv_x,
         // FP8 checks
     if (use_ue8m0)
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
-    // Preserve legacy host signature parameters while adopting the new kernel launch.
-    // (void)mask_buffer_ptr;
-    // (void)cumulative_local_expert_recv_stats;
-    // (void)dispatch_wait_recv_cost_stats;
-    // (void)round_scale;
-    // (void)use_ue8m0;
-    // (void)num_device_sms;
 
     static_assert(sizeof(topk_idx_t) == sizeof(int64_t),
                   "internode_ll::dispatch requires 64-bit topk indices");
@@ -614,7 +604,7 @@ combine(void* combined_x,
 #if !defined(ROCM_DISABLE_CTX)
     __shared__ internode::shmem_ctx_t ctx;
     if constexpr(kMultinode)
-        EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0);
+        EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0 or ctx == ROCSHMEM_CTX_INVALID);
 #endif
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -746,14 +736,6 @@ combine(void* combined_x,
                 st_na_release(reinterpret_cast<int64_t*>(rdma_recv_flag + global_expert_idx), 1);
             }
             atomic_add_relaxed_global(atomic_clean_flag, -1);
-//                 if constexpr (kMultinode){
-// #if defined(ROCM_DISABLE_CTX)
-//                     internode::shmem_fence();
-// #else
-//                     internode::shmem_ctx_quiet(ctx);
-// #endif
-//                 }
-
         }
     }
 

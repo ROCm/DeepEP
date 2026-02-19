@@ -859,13 +859,13 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
     EP_DEVICE_ASSERT(kNumRanks <= blockDim.x);
 
     // Check timeout
-    auto start_time = clock64();
+    auto start_time = wall_clock64();
     while (true) {
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
         if (__all_sync(kFullWarpMask, value <= 0))
             break;
 
-        if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
+        if (wall_clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
             printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value);
             trap();
         }

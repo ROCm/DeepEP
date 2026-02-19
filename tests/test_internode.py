@@ -6,7 +6,7 @@ import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
 import deep_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, hash_tensor
+from utils import init_dist, bench, bench_kineto, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, hash_tensor, use_rocm
 
 # Test compatibility with low latency functions
 import test_low_latency
@@ -301,8 +301,12 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks,  backend=args.backend)
     if args.test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
-
-    num_sms = 64
+    if (use_rocm and num_ranks < 64):
+        num_sms = 64
+    elif (use_rocm and num_ranks >= 64):
+        num_sms = 32 
+    else:
+        num_sms = 24
     num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
 
     buffer = deep_ep.Buffer(group,
