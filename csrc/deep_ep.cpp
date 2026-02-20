@@ -1,18 +1,18 @@
-#include "deep_ep.hpp"
-
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
+#include <atomic>
+#include <chrono>
 #include <cuda_runtime.h>
+#include <memory>
 #include <pybind11/functional.h>
 #include <torch/python.h>
 
-#include <chrono>
-#include <memory>
-
+#include "deep_ep.hpp"
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
 
-<<<<<<< HEAD
+
+#ifndef USE_ROCM
 namespace shared_memory {
 void cu_mem_set_access_all(void* ptr, size_t size) {
     int device_count;
@@ -123,15 +123,8 @@ void SharedMemoryAllocator::close_mem_handle(void* ptr) {
     }
 }
 }  // namespace shared_memory
+#endif
 
-=======
-int get_env_with_default_value(const std::string& env_path, const std::string& default_value) {
-    const char* value = std::getenv(env_path.c_str());
-    std::string value_str = (value != nullptr) ? std::string(value) : default_value;
-    return std::stoi(value_str);
-}
-
->>>>>>> 577efe8 (Enable AMD support)
 namespace deep_ep {
 
 Buffer::Buffer(int rank,
@@ -152,18 +145,18 @@ Buffer::Buffer(int rank,
       comm_stream(at::cuda::getStreamFromPool(true)),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
-    int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
+    int64_t barrier_signal_bytes = NUM_MAX_FIFO_SLOTS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
     int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int*);
 
     // Common checks
     EP_STATIC_ASSERT(NUM_BUFFER_ALIGNMENT_BYTES % sizeof(int4) == 0, "Invalid alignment");
     EP_HOST_ASSERT(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
-                   (num_nvl_bytes <= std::numeric_limits<int>::max() or num_rdma_bytes == 0));
+                   (num_nvl_bytes <= std::numeric_limits<int64_t>::max() or num_rdma_bytes == 0));
     EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
-                   (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int>::max()));
-    EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int>::max());
-    EP_HOST_ASSERT(num_rdma_bytes / sizeof(int4) < std::numeric_limits<int>::max());
+                   (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int64_t>::max()));
+    EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int64_t>::max());
+    EP_HOST_ASSERT(num_rdma_bytes / sizeof(int4) < std::numeric_limits<int64_t>::max());
     EP_HOST_ASSERT(0 <= rank and rank < num_ranks and (num_ranks <= NUM_MAX_NVL_PEERS * NUM_MAX_RDMA_PEERS or low_latency_mode));
     EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
     if (num_rdma_bytes > 0)
@@ -173,13 +166,17 @@ Buffer::Buffer(int rank,
     CUDA_CHECK(cudaGetDevice(&device_id));
     rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     num_rdma_ranks = std::max(1, num_ranks / NUM_MAX_NVL_PEERS), num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
-#ifdef DISABLE_NVSHMEM
+#if defined(DISABLE_NVSHMEM) && !defined(USE_ROCM) 
     EP_HOST_ASSERT(num_rdma_ranks == 1 and not low_latency_mode and "NVSHMEM is disabled during compilation");
 #endif
 
     // Get device info
     cudaDeviceProp device_prop = {};
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device_id));
+#ifdef USE_ROCM
+    sscanf(device_prop.gcnArchName, "gfx%d", &gfx);
+    EP_HOST_ASSERT(gfx >= 942);
+#endif    
     num_device_sms = device_prop.multiProcessorCount;
 
     // Number of per-channel bytes cannot be large
@@ -187,32 +184,26 @@ Buffer::Buffer(int rank,
     EP_HOST_ASSERT(ceil_div<int64_t>(num_rdma_bytes, num_device_sms / 2) < std::numeric_limits<int>::max());
 
     if (num_nvl_bytes > 0) {
-<<<<<<< HEAD
+        // Local IPC: alloc local memory and set local IPC handles
+#ifdef USE_ROCM
+    	CUDA_CHECK(hipExtMallocWithFlags(&buffer_ptrs[nvl_rank], num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes, hipDeviceMallocUncached));
+        CUDA_CHECK(cudaIpcGetMemHandle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]));
+#else
         // Local IPC: alloc local memory and set local IPC handles
         shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank],
                                        num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes);
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
-        buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
-=======
-        // Local IPC: alloc local memory and set local IPC handle
-#ifdef USE_ROCM
-	CUDA_CHECK(hipExtMallocWithFlags(&buffer_ptrs[nvl_rank], num_nvl_bytes + fifo_bytes + buffer_ptr_bytes + task_ptr_bytes, hipDeviceMallocUncached));
-#else
-        CUDA_CHECK(cudaMalloc(&buffer_ptrs[nvl_rank], num_nvl_bytes + fifo_bytes + buffer_ptr_bytes + task_ptr_bytes));
 #endif
-        CUDA_CHECK(cudaIpcGetMemHandle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]));
-        buffer_ptrs_gpu = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + fifo_bytes);
->>>>>>> 577efe8 (Enable AMD support)
+        buffer_ptrs_gpu = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
         // Set barrier signals
-        barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes);
+        barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes);
         barrier_signal_ptrs_gpu =
-            reinterpret_cast<int**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
+            reinterpret_cast<int**>(reinterpret_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
 
         // No need to synchronize, will do a full device sync during `sync`
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
     }
-
     // Create 32 MiB workspace
 #ifdef USE_ROCM
     CUDA_CHECK(hipExtMallocWithFlags(&workspace, NUM_WORKSPACE_BYTES, hipDeviceMallocUncached));
@@ -221,6 +212,14 @@ Buffer::Buffer(int rank,
 #endif
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
 
+    // global_atomic_counter for grid_barrier, ROCM only
+#ifdef USE_ROCM
+    CUDA_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&dispatch_global_atomic_counter), sizeof(int), hipDeviceMallocUncached));
+    CUDA_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&combine_global_atomic_counter), sizeof(int), hipDeviceMallocUncached));
+    CUDA_CHECK(cudaMemsetAsync(dispatch_global_atomic_counter, 0, sizeof(int), comm_stream));
+    CUDA_CHECK(cudaMemsetAsync(combine_global_atomic_counter, 0, sizeof(int), comm_stream));
+#endif
+
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_counter_mapped), const_cast<int*>(moe_recv_counter), 0));
@@ -228,13 +227,8 @@ Buffer::Buffer(int rank,
 
     // MoE expert-level counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_expert_counter, sizeof(int) * NUM_MAX_LOCAL_EXPERTS, cudaHostAllocMapped));
-<<<<<<< HEAD
-    CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_expert_counter_mapped, const_cast<int*>(moe_recv_expert_counter), 0));
-    for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
-=======
     CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_expert_counter_mapped), const_cast<int*>(moe_recv_expert_counter), 0));
-    for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++ i)
->>>>>>> 577efe8 (Enable AMD support)
+    for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
         moe_recv_expert_counter[i] = -1;
 
     // MoE RDMA-level counter
@@ -279,22 +273,17 @@ int Buffer::get_local_device_id() const {
 }
 
 pybind11::bytearray Buffer::get_local_ipc_handle() const {
-    const shared_memory::MemHandle& handle = ipc_handles[nvl_rank];
-    return {reinterpret_cast<const char*>(&handle), sizeof(handle)};
+    return {ipc_handles[nvl_rank].reserved, CUDA_IPC_HANDLE_SIZE};
 }
 
 pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
-#ifndef DISABLE_NVSHMEM
+#if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
     EP_HOST_ASSERT(rdma_rank == 0 and "Only RDMA rank 0 can get NVSHMEM unique ID");
     auto unique_id = internode::get_unique_id();
     return {reinterpret_cast<const char*>(unique_id.data()), unique_id.size()};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
 #endif
-}
-
-pybind11::bytearray Buffer::get_local_pxn_ipc_handle() const {
-    return {pxn_ipc_handles[nvl_rank].reserved, CUDA_IPC_HANDLE_SIZE};
 }
 
 torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
@@ -309,6 +298,10 @@ torch::Stream Buffer::get_comm_stream() const {
     return comm_stream;
 }
 
+void Buffer::move_fifo_slots(int num_slots) {
+    head = (head + num_ranks * num_slots) % NUM_MAX_FIFO_SLOTS;
+}
+
 void Buffer::destroy() {
     EP_HOST_ASSERT(not destroyed);
 
@@ -317,22 +310,32 @@ void Buffer::destroy() {
 
     if (num_nvl_bytes > 0) {
         // Barrier
-        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
+        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream, head);
+        move_fifo_slots();
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Close remote IPC
         if (is_available()) {
             for (int i = 0; i < num_nvl_ranks; ++i)
                 if (i != nvl_rank)
-                    shared_memory_allocator.close_mem_handle(buffer_ptrs[i]);
+                    #ifdef USE_ROCM
+                        CUDA_CHECK(cudaIpcCloseMemHandle(buffer_ptrs[i]));
+                    #else
+                        shared_memory_allocator.close_mem_handle(buffer_ptrs[i]);
+                    #endif
         }
 
         // Free local buffer and error flag
-        shared_memory_allocator.free(buffer_ptrs[nvl_rank]);
+        #ifdef USE_ROCM
+            CUDA_CHECK(cudaFree(buffer_ptrs[nvl_rank]));
+        #else
+            // Free local buffer and error flag
+            shared_memory_allocator.free(buffer_ptrs[nvl_rank]);
+        #endif
     }
 
     // Free NVSHMEM
-#ifndef DISABLE_NVSHMEM
+#if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
     if (is_available() and num_rdma_bytes > 0) {
         CUDA_CHECK(cudaDeviceSynchronize());
         internode::barrier();
@@ -368,13 +371,13 @@ void Buffer::sync(const std::vector<int>& device_ids,
         for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
             EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
-            EP_HOST_ASSERT(handle_str.size() == shared_memory::HANDLE_SIZE);
+            EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
             if (offset + i != rank) {
-                std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
-                shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
+                std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
+                CUDA_CHECK(cudaIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
             } else {
-                EP_HOST_ASSERT(std::memcmp(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE) == 0);
+                EP_HOST_ASSERT(std::memcmp(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE) == 0);
             }
         }
 
@@ -385,7 +388,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
     }
 
     // Sync NVSHMEM handles and allocate memory
-#ifndef DISABLE_NVSHMEM
+#if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
     if (num_rdma_bytes > 0) {
         // Initialize NVSHMEM
         EP_HOST_ASSERT(root_unique_id_opt.has_value());
@@ -396,11 +399,12 @@ void Buffer::sync(const std::vector<int>& device_ids,
         auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
         internode::barrier();
+
         // Allocate
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
+
         // Clean buffer (mainly for low-latency mode)
         CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
-<<<<<<< HEAD
 
         // Allocate and clean shrink buffer
         if (enable_shrink) {
@@ -412,48 +416,15 @@ void Buffer::sync(const std::vector<int>& device_ids,
             CUDA_CHECK(cudaMemset(sync_buffer_ptr, 0, num_sync_buffer_bytes));
         }
 
-=======
->>>>>>> 577efe8 (Enable AMD support)
         // Barrier
         internode::barrier();
         CUDA_CHECK(cudaDeviceSynchronize());
     }
-<<<<<<< HEAD
 #endif
 
     // Ready to use
-=======
->>>>>>> 577efe8 (Enable AMD support)
     available = true;
 }
-
-void Buffer::sync_pxn_handles(const std::vector<int>& device_ids, const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles) {
-    // Sync NVSHMEM handles and allocate memory
-    if (num_rdma_bytes > 0) {
-        EP_HOST_ASSERT(not is_available());
-        EP_HOST_ASSERT(num_ranks == device_ids.size());
-        EP_HOST_ASSERT(device_ids.size() == all_gathered_handles.size());
-        for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++ i) {
-            EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
-            auto handle_str = std::string(all_gathered_handles[offset + i].value());
-            EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
-            if (offset + i != rank) {
-                std::memcpy(pxn_ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
-                CUDA_CHECK(cudaIpcOpenMemHandle(&nvl_buffer_ptrs[i], pxn_ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
-            } else {
-                EP_HOST_ASSERT(std::memcmp(pxn_ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE) == 0);
-            }
-        }
-        int64_t buffer_ptr_bytes = sizeof(void*) * NUM_MAX_NVL_PEERS;
-        // Barrier
-        internode::barrier();
-        CUDA_CHECK(cudaDeviceSynchronize());
-        // Ready to use
-        available = true;
-    }
-}
-
-
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
 Buffer::get_dispatch_layout(
@@ -549,7 +520,6 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            bool async,
                            bool allocate_on_comm_stream) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
-
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
@@ -646,7 +616,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     // Barrier or send sizes
     // To clean: channel start/end offset, head and tail
-    int num_memset_int = num_channels * num_ranks * 4;
+    int num_memset_int = num_channels * num_ranks * 4;    
     if (cached_mode) {
         num_recv_tokens = cached_num_recv_tokens;
         rank_prefix_matrix = cached_rank_prefix_matrix.value();
@@ -654,7 +624,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
         // Copy rank prefix matrix and clean flags
         intranode::cached_notify_dispatch(
-            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
+            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream, head);
+        move_fifo_slots(2);
     } else {
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -684,7 +655,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                    barrier_signal_ptrs_gpu,
                                    rank,
                                    comm_stream,
-                                   num_channels);
+                                   num_channels,
+                                   head);
+        move_fifo_slots(3);
 
         if (num_worst_tokens > 0) {
             // No CPU sync, just allocate the worst case
@@ -693,21 +666,22 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             // Must be forward with top-k stuffs
             EP_HOST_ASSERT(topk_idx.has_value());
             EP_HOST_ASSERT(topk_weights.has_value());
-        } else {
+        } else { 
             // Synchronize total received tokens and tokens per expert
             auto start_time = std::chrono::high_resolution_clock::now();
             while (true) {
                 // Read total count
                 num_recv_tokens = static_cast<int>(*moe_recv_counter);
-
+                
                 // Read per-expert count
                 bool ready = (num_recv_tokens >= 0);
                 for (int i = 0; i < num_local_experts and ready; ++i)
+                {
                     ready &= moe_recv_expert_counter[i] >= 0;
+                }
 
                 if (ready)
                     break;
-
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
                     NUM_CPU_TIMEOUT_SECS)
@@ -906,20 +880,25 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                      barrier_signal_ptrs_gpu,
                                      rank,
                                      num_ranks,
-                                     comm_stream);
-
-    // Assign bias pointers
-    auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
-    void* bias_ptrs[2] = {nullptr, nullptr};
-    for (int i = 0; i < 2; ++i)
-        if (bias_opts[i].has_value()) {
-            auto bias = bias_opts[i].value();
-            EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
-            EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
-            EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
-            bias_ptrs[i] = bias.data_ptr();
-        }
-
+                                     comm_stream,
+                                     head);
+    // NOTES: this function uses two FIFO slots (barrier before and after)
+    #ifdef USE_ROCM    
+        move_fifo_slots(2);                
+    #else
+        // Assign bias pointers
+        // At this time, the optional bias is not supported by the underlying kernels. 
+        auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
+        void* bias_ptrs[2] = {nullptr, nullptr};
+        for (int i = 0; i < 2; ++i)
+            if (bias_opts[i].has_value()) {
+                auto bias = bias_opts[i].value();
+                EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
+                EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
+                EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
+                bias_ptrs[i] = bias.data_ptr();
+            }
+        
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 +  // Queue head and tail
@@ -927,13 +906,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
                    <= num_nvl_bytes);
+
     intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
                        recv_topk_weights_ptr,
                        x.data_ptr(),
                        topk_weights_ptr,
-                       bias_ptrs[0],
-                       bias_ptrs[1],
                        src_idx.data_ptr<int>(),
                        rank_prefix_matrix.data_ptr<int>(),
                        channel_prefix_matrix.data_ptr<int>(),
@@ -959,7 +937,14 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
+        #ifndef USE_ROCM
+            for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
+                to.has_value() ? to->record_stream(comm_stream) : void();
+                if (allocate_on_comm_stream)
+                    to.has_value() ? to->record_stream(compute_stream) : void();
+            }
+        #endif
+        for (auto& to : {topk_weights, recv_topk_weights}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
@@ -975,7 +960,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     return {recv_x, recv_topk_weights, event};
 }
 
-<<<<<<< HEAD
 std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
@@ -1006,29 +990,18 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix,
                            const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
                            int expert_alignment,
-                           int num_worst_tokens,
                            const Config& config,
                            std::optional<EventHandle>& previous_event,
                            bool async,
                            bool allocate_on_comm_stream) {
-#ifndef DISABLE_NVSHMEM
+
+#if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
     // unless we release GIL here.
     pybind11::gil_scoped_release release;
 
-=======
-// Internode functionality
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<EventHandle>>
-Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& x_scales,
-                           const std::optional<torch::Tensor>& topk_idx, const std::optional<torch::Tensor>& topk_weights,
-                           const std::optional<torch::Tensor>& num_tokens_per_rank, const std::optional<torch::Tensor>& num_tokens_per_rdma_rank,
-                           const torch::Tensor& is_token_in_rank, const std::optional<torch::Tensor>& num_tokens_per_expert,
-                           int cached_num_recv_tokens, int cached_num_rdma_recv_tokens,
-                           const std::optional<torch::Tensor>& cached_rdma_channel_prefix_matrix, const std::optional<torch::Tensor>& cached_recv_rdma_rank_prefix_sum,
-                           const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix, const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
-                           int expert_alignment, const Config& config, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
->>>>>>> 577efe8 (Enable AMD support)
+
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     EP_HOST_ASSERT(0 < get_num_rdma_ranks() and get_num_rdma_ranks() <= NUM_MAX_RDMA_PEERS);
@@ -1171,6 +1144,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                  num_nvl_bytes,
                                  true,
                                  low_latency_mode);
+        move_fifo_slots(2);
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -1191,7 +1165,6 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                    num_experts,
                                    is_token_in_rank.data_ptr<bool>(),
                                    num_tokens,
-                                   num_worst_tokens,
                                    num_channels,
                                    hidden_int4,
                                    num_scales,
@@ -1211,12 +1184,13 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                    num_nvl_bytes,
                                    low_latency_mode);
+        move_fifo_slots(3);
 
         // Synchronize total received tokens and tokens per expert
         if (num_worst_tokens > 0) {
             num_recv_tokens = num_worst_tokens;
             num_rdma_recv_tokens = num_worst_tokens;
-        } else {
+        } else {        
             auto start_time = std::chrono::high_resolution_clock::now();
             while (true) {
                 // Read total count
@@ -1298,7 +1272,6 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
                         recv_gbl_rank_prefix_sum.data_ptr<int>(),
                         is_token_in_rank.data_ptr<bool>(),
                         num_tokens,
-                        num_worst_tokens,
                         hidden_int4,
                         num_scales,
                         num_topk,
@@ -1401,7 +1374,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     std::optional<EventHandle>& previous_event,
     bool async,
     bool allocate_on_comm_stream) {
-#ifndef DISABLE_NVSHMEM
+#if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
 
@@ -1486,10 +1459,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              barrier_signal_ptrs_gpu,
                              rank,
                              comm_stream,
-                             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+                             num_rdma_bytes,
                              num_nvl_bytes,
                              false,
                              low_latency_mode);
+    move_fifo_slots(2);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -1574,13 +1548,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 }
 
 void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
-<<<<<<< HEAD
-#ifndef DISABLE_NVSHMEM
-=======
-#if DISABLE_INTERNODE
-    throw std::runtime_error("Low-latency mode is disabled");
-#else
->>>>>>> 577efe8 (Enable AMD support)
+#if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
     EP_HOST_ASSERT(low_latency_mode);
 
     auto layout = LowLatencyLayout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
@@ -1594,16 +1562,15 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
     check_boundary(clean_meta_0.first, clean_meta_0.second * sizeof(int));
     check_boundary(clean_meta_1.first, clean_meta_1.second * sizeof(int));
 
-    internode_ll::clean_low_latency_buffer(clean_meta_0.first,
+    internode_ll::clean_low_latency_buffer(reinterpret_cast<int64_t*>(clean_meta_0.first),
                                            clean_meta_0.second,
-                                           clean_meta_1.first,
+                                           reinterpret_cast<int64_t*>(clean_meta_1.first),
                                            clean_meta_1.second,
                                            rank,
                                            num_ranks,
                                            mask_buffer_ptr,
                                            sync_buffer_ptr,
                                            at::cuda::getCurrentCUDAStream());
-<<<<<<< HEAD
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
 #endif
@@ -1627,20 +1594,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
                              bool use_ue8m0,
                              bool async,
                              bool return_recv_hook) {
-#ifndef DISABLE_NVSHMEM
-=======
-#endif //DISABLE_INTERNODE
-}
-
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
-Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
-                             int num_max_dispatch_tokens_per_rank, int num_experts,
-                             bool use_fp8, bool async, bool return_recv_hook) {
-#if DISABLE_INTERNODE
-    throw std::runtime_error("Low-latency mode is disabled");
-#else
-                                
->>>>>>> 577efe8 (Enable AMD support)
+#if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
     EP_HOST_ASSERT(low_latency_mode);
 
     // Tensor checks
@@ -1674,36 +1628,27 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
 
-    // Buffer control
-    LowLatencyLayout nvl_layout(nvl_buffer_ptrs[nvl_rank], num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
-    EP_HOST_ASSERT(nvl_layout.total_bytes <= num_rdma_bytes);
-    auto nvl_buffer = nvl_layout.buffers[low_latency_buffer_idx ^= 1];
-    auto nvl_next_buffer = nvl_layout.buffers[low_latency_buffer_idx ^= 1];
-    auto global_atomic_counter = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-	
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
+#ifdef USE_ROCM
+    cudaMemsetAsync(dispatch_global_atomic_counter, 0, sizeof(int), launch_stream);
+#endif
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
     // Allocate packed tensors
 #ifdef USE_ROCM
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-<<<<<<< HEAD
-                                      x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
-    auto packed_recv_src_info =
-        torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-=======
-                                      x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fnuz: torch::kBFloat16));
+                                      x.options().dtype(use_fp8 ? (gfx == 942 ? torch::kFloat8_e4m3fnuz : torch::kFloat8_e4m3fn) : torch::kBFloat16));
 #else
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-                                      x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16);
-#endif
-    auto packed_recv_src_info = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
->>>>>>> 577efe8 (Enable AMD support)
+                                      x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
+#endif                                
+    auto packed_recv_src_info =
+        torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
     auto packed_recv_count = torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
@@ -1730,7 +1675,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
-<<<<<<< HEAD
         internode_ll::dispatch(
             packed_recv_x.data_ptr(),
             packed_recv_x_scales_ptr,
@@ -1741,11 +1685,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
             cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
             dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
             buffer.dispatch_rdma_recv_data_buffer,
-            buffer.dispatch_rdma_recv_count_buffer,
+            reinterpret_cast<int64_t*>(buffer.dispatch_rdma_recv_count_buffer),
             buffer.dispatch_rdma_send_buffer,
             x.data_ptr(),
             topk_idx.data_ptr<topk_idx_t>(),
-            next_clean_meta.first,
+            reinterpret_cast<int64_t*>(next_clean_meta.first),
             next_clean_meta.second,
             num_tokens,
             hidden,
@@ -1760,20 +1704,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
             workspace,
             num_device_sms,
             launch_stream,
-            phases);
-=======
-        internode_ll::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
-                            packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
-                            packed_recv_count.data_ptr<int>(),
-                            global_atomic_counter.data_ptr<int>(),
-                            buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
-                            buffer.dispatch_rdma_send_buffer,
-                            x.data_ptr(), topk_idx.data_ptr<int64_t>(),
-                            next_clean_meta.first, next_clean_meta.second,
-                            num_tokens, hidden, num_max_dispatch_tokens_per_rank,
-                            num_topk, num_experts, rank, num_ranks, use_fp8,
-                            workspace, launch_stream, phases);
->>>>>>> 577efe8 (Enable AMD support)
+            phases
+#ifdef USE_ROCM
+            ,dispatch_global_atomic_counter
+#endif
+        );
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
@@ -1794,7 +1729,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
 
     // Return values
     return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, recv_hook};
-<<<<<<< HEAD
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
@@ -1815,23 +1749,8 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     bool async,
     bool return_recv_hook,
     const std::optional<torch::Tensor>& out) {
-#ifndef DISABLE_NVSHMEM
-=======
-#endif //DISABLE_INTERNODE
-}
-
-std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
-Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
-                            const torch::Tensor& src_info, const torch::Tensor& layout_range,
-                            int num_max_dispatch_tokens_per_rank, int num_experts,
-                            bool zero_copy, bool async, bool return_recv_hook,
-                            const std::optional<torch::Tensor>& out) {
-#if DISABLE_INTERNODE
-    throw std::runtime_error("Low-latency mode is disabled");
-#else
-
->>>>>>> 577efe8 (Enable AMD support)
-    EP_HOST_ASSERT(low_latency_mode);
+#if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
+        EP_HOST_ASSERT(low_latency_mode);
 
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1859,24 +1778,22 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     auto hidden = static_cast<int>(x.size(2));
     auto num_topk = static_cast<int>(topk_weights.size(1));
     auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
-    auto global_atomic_counter = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+
+
     // Buffer control
     LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
-    
-    // Buffer control
-    LowLatencyLayout nvl_layout(nvl_buffer_ptrs[nvl_rank], num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
-    EP_HOST_ASSERT(nvl_layout.total_bytes <= num_rdma_bytes);
-    auto nvl_buffer = nvl_layout.buffers[low_latency_buffer_idx ^= 1];
-    auto nvl_next_buffer = nvl_layout.buffers[low_latency_buffer_idx ^= 1];
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
+#ifdef USE_ROCM
+    cudaMemsetAsync(combine_global_atomic_counter, 0, sizeof(int), launch_stream);
+#endif
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
@@ -1896,9 +1813,12 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     auto launcher = [=](int phases) {
         internode_ll::combine(combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer,
+#ifdef USE_ROCM
+                              reinterpret_cast<int64_t*>(buffer.combine_rdma_recv_flag_buffer),
+#else
                               buffer.combine_rdma_recv_flag_buffer,
+#endif
                               buffer.combine_rdma_send_buffer,
-<<<<<<< HEAD
                               x.data_ptr(),
                               topk_idx.data_ptr<topk_idx_t>(),
                               topk_weights.data_ptr<float>(),
@@ -1906,7 +1826,11 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                               layout_range.data_ptr<int64_t>(),
                               mask_buffer_ptr,
                               combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+#ifdef USE_ROCM
+                              reinterpret_cast<int64_t*>(next_clean_meta.first),
+#else
                               next_clean_meta.first,
+#endif
                               next_clean_meta.second,
                               num_combined_tokens,
                               hidden,
@@ -1920,17 +1844,11 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                               num_device_sms,
                               launch_stream,
                               phases,
-                              zero_copy);
-=======
-                              x.data_ptr(), topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
-                              src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
-                              global_atomic_counter.data_ptr<int>(),
-                              next_clean_meta.first, next_clean_meta.second,
-                              num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
-                              num_topk, num_experts, rank, num_ranks,
-                              workspace, launch_stream,
-                              phases, zero_copy);
->>>>>>> 577efe8 (Enable AMD support)
+                              zero_copy
+#ifdef USE_ROCM
+                              ,combine_global_atomic_counter
+#endif
+                            );
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
@@ -1951,7 +1869,6 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
 
     // Return values
     return {combined_x, event, recv_hook};
-<<<<<<< HEAD
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
@@ -1959,17 +1876,9 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
 }
 
 torch::Tensor Buffer::get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const {
-#ifndef DISABLE_NVSHMEM
+#if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
     LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
 
-=======
-#endif // DISABLE_INTERNODE
-}
-
-torch::Tensor
-Buffer::get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
-    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
->>>>>>> 577efe8 (Enable AMD support)
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto dtype = torch::kBFloat16;
     auto num_msg_elems = static_cast<int>(buffer.num_bytes_per_combine_msg / elementSize(torch::kBFloat16));
@@ -1979,7 +1888,6 @@ Buffer::get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank
                             {num_experts / num_ranks, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
                             {num_ranks * num_max_dispatch_tokens_per_rank * num_msg_elems, num_msg_elems, 1},
                             torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
-<<<<<<< HEAD
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
@@ -2014,38 +1922,6 @@ void Buffer::low_latency_clean_mask_buffer() {
 }
 
 }  // namespace deep_ep
-=======
-}
-
-std::string Buffer::get_local_ipc_handle_string() const {
-    return std::string(reinterpret_cast<const char*>(ipc_handles[nvl_rank].reserved), CUDA_IPC_HANDLE_SIZE);
-}
-
-std::string Buffer::get_local_nvshmem_unique_id_string() const {
-    EP_HOST_ASSERT(rdma_rank == 0 and "Only RDMA rank 0 can get NVSHMEM unique ID");
-    auto unique_id = internode::get_unique_id();
-    return std::string(reinterpret_cast<const char*>(unique_id.data()), unique_id.size());
-}
-
-void Buffer::sync_string(const std::vector<int> &device_ids,
-                         const std::vector<std::string> &all_gathered_handles,
-                         const std::string& root_unique_id_opt) {
-    std::vector<std::optional<pybind11::bytearray>> py_all_gathered_handles;
-    for (auto& handle : all_gathered_handles) {
-        std::optional<pybind11::bytearray> py_handle_opt = std::nullopt;
-        if (!handle.empty()) {
-            py_handle_opt.emplace(handle.c_str(), handle.size());
-        }
-        py_all_gathered_handles.push_back(py_handle_opt);
-    }
-    std::optional<pybind11::bytearray> py_root_unique_id_opt = std::nullopt;
-    if (!root_unique_id_opt.empty()) {
-        py_root_unique_id_opt.emplace(root_unique_id_opt.c_str(), root_unique_id_opt.size());
-    }
-    sync(device_ids, py_all_gathered_handles, py_root_unique_id_opt);
-}
-} // namespace deep_ep
->>>>>>> 577efe8 (Enable AMD support)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepEP: an efficient expert-parallel communication library";
@@ -2066,10 +1942,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
-        .def("get_local_pxn_ipc_handle", &deep_ep::Buffer::get_local_pxn_ipc_handle)
-        .def("sync_pxn_handles", &deep_ep::Buffer::sync_pxn_handles)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
         .def("get_root_rdma_rank", &deep_ep::Buffer::get_root_rdma_rank)
@@ -2088,7 +1962,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
-<<<<<<< HEAD
         .def("low_latency_update_mask_buffer", &deep_ep::Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
@@ -2097,7 +1970,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
     m.attr("topk_idx_t") =
         py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
-=======
-        .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
->>>>>>> 577efe8 (Enable AMD support)
 }
