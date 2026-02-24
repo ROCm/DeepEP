@@ -145,18 +145,31 @@ Buffer::Buffer(int rank,
       comm_stream(at::cuda::getStreamFromPool(true)),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
+#ifdef USE_ROCM
     int64_t barrier_signal_bytes = NUM_MAX_FIFO_SLOTS * sizeof(int);
+#else
+    int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
+#endif 
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
     int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int*);
 
     // Common checks
     EP_STATIC_ASSERT(NUM_BUFFER_ALIGNMENT_BYTES % sizeof(int4) == 0, "Invalid alignment");
+#ifdef USE_ROCM
     EP_HOST_ASSERT(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
                    (num_nvl_bytes <= std::numeric_limits<int64_t>::max() or num_rdma_bytes == 0));
     EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
                    (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int64_t>::max()));
     EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int64_t>::max());
     EP_HOST_ASSERT(num_rdma_bytes / sizeof(int4) < std::numeric_limits<int64_t>::max());
+#else
+    EP_HOST_ASSERT(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
+                   (num_nvl_bytes <= std::numeric_limits<int>::max() or num_rdma_bytes == 0));
+    EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
+                   (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int>::max()));
+    EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_rdma_bytes / sizeof(int4) < std::numeric_limits<int>::max());
+#endif
     EP_HOST_ASSERT(0 <= rank and rank < num_ranks and (num_ranks <= NUM_MAX_NVL_PEERS * NUM_MAX_RDMA_PEERS or low_latency_mode));
     EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
     if (num_rdma_bytes > 0)
@@ -194,13 +207,22 @@ Buffer::Buffer(int rank,
                                        num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes);
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
 #endif
+
+#ifdef USE_ROCM
         buffer_ptrs_gpu = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
         // Set barrier signals
         barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes);
         barrier_signal_ptrs_gpu =
             reinterpret_cast<int**>(reinterpret_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
+#else
+        buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
+        // Set barrier signals
+        barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes);
+        barrier_signal_ptrs_gpu =
+            reinterpret_cast<int**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
+#endif
         // No need to synchronize, will do a full device sync during `sync`
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
     }
@@ -222,12 +244,20 @@ Buffer::Buffer(int rank,
 
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
+#ifdef USE_ROCM
     CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_counter_mapped), const_cast<int*>(moe_recv_counter), 0));
+#else
+    CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_counter_mapped, const_cast<int*>(moe_recv_counter), 0));
+#endif
     *moe_recv_counter = -1;
 
     // MoE expert-level counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_expert_counter, sizeof(int) * NUM_MAX_LOCAL_EXPERTS, cudaHostAllocMapped));
+#ifdef USE_ROCM
     CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_expert_counter_mapped), const_cast<int*>(moe_recv_expert_counter), 0));
+#else
+    CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_expert_counter_mapped, const_cast<int*>(moe_recv_expert_counter), 0));
+#endif
     for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
         moe_recv_expert_counter[i] = -1;
 
@@ -273,7 +303,12 @@ int Buffer::get_local_device_id() const {
 }
 
 pybind11::bytearray Buffer::get_local_ipc_handle() const {
+//TODO: Can we just use upstream here?
+#ifdef USE_ROCM
     return {ipc_handles[nvl_rank].reserved, CUDA_IPC_HANDLE_SIZE};
+#else
+    return {reinterpret_cast<const char*>(&handle), sizeof(handle)};
+#endif
 }
 
 pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
@@ -310,8 +345,13 @@ void Buffer::destroy() {
 
     if (num_nvl_bytes > 0) {
         // Barrier
-        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream, head);
+#ifdef USE_ROCM
+        // TODO remove head from function signature.
+        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream, head);        
         move_fifo_slots();
+#else
+        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
+#endif
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Close remote IPC
@@ -371,7 +411,11 @@ void Buffer::sync(const std::vector<int>& device_ids,
         for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
             EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
+#ifdef USE_ROCM            
             EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
+#else
+            EP_HOST_ASSERT(handle_str.size() == shared_memory::HANDLE_SIZE);
+#endif
             if (offset + i != rank) {
                 std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
                 CUDA_CHECK(cudaIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
@@ -623,9 +667,15 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         channel_prefix_matrix = cached_channel_prefix_matrix.value();
 
         // Copy rank prefix matrix and clean flags
+        // TOOD: remove head from signature to match upstream.
+#ifdef USE_ROCM
         intranode::cached_notify_dispatch(
             rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream, head);
         move_fifo_slots(2);
+#else
+        intranode::cached_notify_dispatch(
+            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
+#endif
     } else {
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -872,6 +922,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
+    //TODO: Remove head from signature to match upstream
     intranode::cached_notify_combine(buffer_ptrs_gpu,
                                      send_head.data_ptr<int>(),
                                      num_channels,
@@ -885,7 +936,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     // NOTES: this function uses two FIFO slots (barrier before and after)
     #ifdef USE_ROCM    
         move_fifo_slots(2);                
-    #else
+    #endif
+    #ifndef USE_ROCM
         // Assign bias pointers
         // At this time, the optional bias is not supported by the underlying kernels. 
         auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -898,6 +950,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                 EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
                 bias_ptrs[i] = bias.data_ptr();
             }
+    #endif
         
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
@@ -912,6 +965,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        recv_topk_weights_ptr,
                        x.data_ptr(),
                        topk_weights_ptr,
+#ifndef USE_ROCM
+                       //TODO: Add biases to ROCM path.
+                       bias_ptrs[0],
+                       bias_ptrs[1],
+#endif
                        src_idx.data_ptr<int>(),
                        rank_prefix_matrix.data_ptr<int>(),
                        channel_prefix_matrix.data_ptr<int>(),
@@ -937,18 +995,20 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
+        //TODO: Remove guard once kernel supports biases.
         #ifndef USE_ROCM
             for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
                 to.has_value() ? to->record_stream(comm_stream) : void();
                 if (allocate_on_comm_stream)
                     to.has_value() ? to->record_stream(compute_stream) : void();
             }
+        #else
+            for (auto& to : {topk_weights, recv_topk_weights}) {
+                to.has_value() ? to->record_stream(comm_stream) : void();
+                if (allocate_on_comm_stream)
+                    to.has_value() ? to->record_stream(compute_stream) : void();
+            }
         #endif
-        for (auto& to : {topk_weights, recv_topk_weights}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
-                to.has_value() ? to->record_stream(compute_stream) : void();
-        }
     } else {
         stream_wait(compute_stream, comm_stream);
     }
@@ -990,6 +1050,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix,
                            const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
                            int expert_alignment,
+                           int num_worst_tokens,
                            const Config& config,
                            std::optional<EventHandle>& previous_event,
                            bool async,
@@ -1144,6 +1205,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  num_nvl_bytes,
                                  true,
                                  low_latency_mode);
+        //TODO: Try to remove this code.
         move_fifo_slots(2);
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -1165,6 +1227,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    num_experts,
                                    is_token_in_rank.data_ptr<bool>(),
                                    num_tokens,
+                                   num_worst_tokens,
                                    num_channels,
                                    hidden_int4,
                                    num_scales,
@@ -1190,7 +1253,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         if (num_worst_tokens > 0) {
             num_recv_tokens = num_worst_tokens;
             num_rdma_recv_tokens = num_worst_tokens;
-        } else {        
+        } else {
             auto start_time = std::chrono::high_resolution_clock::now();
             while (true) {
                 // Read total count
@@ -1272,6 +1335,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         recv_gbl_rank_prefix_sum.data_ptr<int>(),
                         is_token_in_rank.data_ptr<bool>(),
                         num_tokens,
+                        num_worst_tokens,
                         hidden_int4,
                         num_scales,
                         num_topk,
@@ -1459,7 +1523,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              barrier_signal_ptrs_gpu,
                              rank,
                              comm_stream,
-                             num_rdma_bytes,
+                             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                              num_nvl_bytes,
                              false,
                              low_latency_mode);
@@ -1562,9 +1626,19 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
     check_boundary(clean_meta_0.first, clean_meta_0.second * sizeof(int));
     check_boundary(clean_meta_1.first, clean_meta_1.second * sizeof(int));
 
-    internode_ll::clean_low_latency_buffer(reinterpret_cast<int64_t*>(clean_meta_0.first),
+
+    internode_ll::clean_low_latency_buffer(
+#ifdef USE_ROCM
+                                           reinterpret_cast<int64_t*>(clean_meta_0.first),
+#else
+                                           clean_meta_0.first,
+#endif
                                            clean_meta_0.second,
+#ifdef USE_ROCM
                                            reinterpret_cast<int64_t*>(clean_meta_1.first),
+#else
+                                           clean_meta_1.first
+#endif
                                            clean_meta_1.second,
                                            rank,
                                            num_ranks,
@@ -1685,11 +1759,19 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
             dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
             buffer.dispatch_rdma_recv_data_buffer,
+#ifdef USE_ROCM
             reinterpret_cast<int64_t*>(buffer.dispatch_rdma_recv_count_buffer),
+#else
+            buffer.dispatch_rdma_recv_count_buffer,
+#endif
             buffer.dispatch_rdma_send_buffer,
             x.data_ptr(),
             topk_idx.data_ptr<topk_idx_t>(),
+#ifdef USE_ROCM
             reinterpret_cast<int64_t*>(next_clean_meta.first),
+#else
+            next_clean_meta.first,
+#endif
             next_clean_meta.second,
             num_tokens,
             hidden,
@@ -1778,7 +1860,6 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     auto hidden = static_cast<int>(x.size(2));
     auto num_topk = static_cast<int>(topk_weights.size(1));
     auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
-
 
     // Buffer control
     LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
@@ -1942,7 +2023,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool>())
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
