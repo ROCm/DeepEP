@@ -21,6 +21,7 @@
 #define TORCH_EXTENSION_NAME deep_ep_cpp
 #endif
 
+#ifndef USE_ROCM
 namespace shared_memory {
 
 union MemHandleInner {
@@ -49,6 +50,7 @@ private:
 };
 }  // namespace shared_memory
 
+#endif
 namespace deep_ep {
 
 struct Buffer {
@@ -75,16 +77,22 @@ private:
 
     // Device info and communication
     int device_id;
+#ifdef USE_ROCM
+    int gfx;
+#endif    
     int num_device_sms;
     int rank, rdma_rank, nvl_rank;
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
-    shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
+    cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
+
+    // Task fifo. Used for ROCM implementation, else ignored.
+    int head = 0;
 
     // Whether explicit `destroy()` is required.
     bool explicitly_destroy;
@@ -98,6 +106,10 @@ private:
     // Workspace
     void* workspace = nullptr;
 
+    // global_atomic_counter
+    int* dispatch_global_atomic_counter = nullptr;
+    int* combine_global_atomic_counter = nullptr;
+
     // Host-side MoE info
     volatile int* moe_recv_counter = nullptr;
     int* moe_recv_counter_mapped = nullptr;
@@ -110,8 +122,9 @@ private:
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
 
-    shared_memory::SharedMemoryAllocator shared_memory_allocator;
-
+private:
+    void move_fifo_slots(int num_slots = 1);
+    
 public:
     Buffer(int rank,
            int num_ranks,
@@ -119,8 +132,7 @@ public:
            int64_t num_rdma_bytes,
            bool low_latency_mode,
            bool explicitly_destroy,
-           bool enable_shrink,
-           bool use_fabric);
+           bool enable_shrink);
 
     ~Buffer() noexcept(false);
 
@@ -188,8 +200,6 @@ public:
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,
         const std::optional<torch::Tensor>& topk_weights,
-        const std::optional<torch::Tensor>& bias_0,
-        const std::optional<torch::Tensor>& bias_1,
         const torch::Tensor& src_idx,
         const torch::Tensor& rank_prefix_matrix,
         const torch::Tensor& channel_prefix_matrix,
@@ -229,7 +239,6 @@ public:
                        const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix,
                        const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
                        int expert_alignment,
-                       int num_worst_tokens,
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
                        bool async,
