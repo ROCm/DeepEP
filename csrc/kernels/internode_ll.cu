@@ -8,7 +8,7 @@
 #include <rocshmem/rocshmem.hpp>
 #include <iostream>
 // low latency+RocSHMEM has issue with CTX.
-#if defined(NIC_CX7)
+#if defined(NIC_IO) || defined(NIC_CX7)
   #define ROCM_DISABLE_CTX
 #endif
 
@@ -65,8 +65,14 @@ __global__ void clean_low_latency_buffer(int64_t* clean_0, int num_clean_int_0,
 #endif
 }
 
-void clean_low_latency_buffer(int64_t* clean_0, int num_clean_int_0,
-                              int64_t* clean_1, int num_clean_int_1,
+void clean_low_latency_buffer(int64_t* clean_0,
+                              int num_clean_int_0,
+                              int64_t* clean_1,
+                              int num_clean_int_1,
+                              int rank,
+                              int num_ranks,
+                              int* mask_buffer_ptr,
+                              int* sync_buffer_ptr,
                               cudaStream_t stream) {
     constexpr int kNumThreads = 256;
 
@@ -75,9 +81,9 @@ void clean_low_latency_buffer(int64_t* clean_0, int num_clean_int_0,
                   clean_0, num_clean_int_0, clean_1, num_clean_int_1);
 }
 
-template <bool kUseFP8, bool kMultinode, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, bool kMultinode, int kNumWarpGroups,  int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * kWarpSize, 1) void
-dispatch(void* packed_recv_x, float* packed_recv_x_scales,
+dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count,
          int* global_atomic_counter,
@@ -87,7 +93,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int64_t* next_clean, int num_next_clean_int,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
-         int phases) {
+         int phases,
+        bool round_scale) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / kWarpSize, lane_id = get_lane_id();
@@ -98,20 +105,28 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
 
+      // May extract UE8M0 from the scales
+    using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
+    using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
+    EP_STATIC_ASSERT(sizeof(packed_t) % sizeof(scale_t) == 0, "Invalid vector length");
 #if !defined(ROCM_DISABLE_CTX)
     __shared__ internode::shmem_ctx_t ctx;
     if constexpr (kMultinode)
-        internode::shmem_wg_ctx_create(&ctx);
+        EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0 or ctx == ROCSHMEM_CTX_INVALID);
 #endif
 
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
 #ifdef USE_ROCM
+#if defined(__gfx942__)
     constexpr float kFP8Margin = 1e-4, kFP8Amax = 240, kFP8AmaxInv = 1.0f / 240.0f;
-    const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__hip_fp8_storage_t) : sizeof(gpu_bfloat16_t));
-#else
+#else //gfx950
     constexpr float kFP8Margin = 1e-4, kFP8Amax = 448, kFP8AmaxInv = 1.0f / 448.0f;
+#endif
     const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__hip_fp8_storage_t) : sizeof(gpu_bfloat16_t));
+#else //NV
+    constexpr float kFP8Margin = 1e-4, kFP8Amax = 448, kFP8AmaxInv = 1.0f / 448.0f;
+    const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(gpu_bfloat16_t));
 #endif
     const int num_scales = kHidden / kNumPerChannels;
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
@@ -169,11 +184,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 #ifdef USE_ROCM
                     // Reduce amax and scale
                     EP_STATIC_ASSERT(kNumElemsPerRead * kWarpSize / kNumPerChannels == 4, "Invalid vectorization");
-                    amax = quarter_warp_reduce_max(amax), scale = kFP8Amax / amax, scale_inv = amax * kFP8AmaxInv;
+                    amax = quarter_warp_reduce_max(amax);
+                    calculate_fp8_scales(amax, scale, scale_inv, round_scale);
                     if (lane_id % 16 == 0)
 #else
                     EP_STATIC_ASSERT(kNumElemsPerRead * kWarpSize / kNumPerChannels == 2, "Invalid vectorization");
-                    amax = half_warp_reduce_max(amax), scale = kFP8Amax / amax, scale_inv = amax * kFP8AmaxInv;
+                    amax = quarter_warp_reduce_max(amax);
+                    calculate_fp8_scales(amax, scale, scale_inv, round_scale);
                     if (lane_id == 0 or lane_id == 16)
 #endif
                         rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
@@ -325,6 +342,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
            if constexpr (!kMultinode){
                 rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
             }else{
+                __threadfence_system();
 #if defined(ROCM_DISABLE_CTX)
                 internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
 #else
@@ -379,10 +397,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 src_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
         const auto recv_x_int4 = reinterpret_cast<int4*>(packed_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4;
-        const auto recv_x_scales = packed_recv_x_scales + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_scales;
+        // const auto recv_x_scales = packed_recv_x_scales + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_scales;
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
         const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
-
+        auto const num_aligned_scales = align<int>(num_scales, sizeof(float) / sizeof(scale_t));
+        auto const recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) +
+                               local_expert_idx * num_ranks *
+                                   num_max_dispatch_tokens_per_rank *
+                                   num_aligned_scales;
         // Shared between sub-warps in warp groups
         __shared__ int shared_num_recv_tokens[kNumWarpGroups], shared_recv_token_begin_idx[kNumWarpGroups];
 
@@ -394,14 +416,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             auto start_time = clock64();
             if constexpr (kMultinode){
                 while ((num_recv_tokens = ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
-                     if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
-                         printf("dispatch recieve time out \n");
+                    if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
+                        printf("dispatch recieve time out \\n");
                     }
                 }
             }else{
                 while ((num_recv_tokens = ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
-                         if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
-                         printf("dispatch recieve single node time out \n");
+                    if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
+                        printf("dispatch recieve single node time out \\n");
                     }
                 }
             }
@@ -435,14 +457,26 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             UNROLLED_WARP_COPY(8, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
 
             // Copy scales
-            if constexpr(kUseFP8) {
+            if (kUseFP8) {
                 const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
-                const auto dst_scales = reinterpret_cast<float*>(recv_x_scales + recv_token_begin_idx + i);
-                const auto scale_stride = num_ranks * num_max_dispatch_tokens_per_rank;
-                auto scale_0 = lane_id < num_scales ? ld_nc_global(src_scales + lane_id) : 0;
-                auto scale_1 = (lane_id + kWarpSize) < num_scales ? ld_nc_global(src_scales + lane_id + kWarpSize) : 0;
-                lane_id < num_scales ? dst_scales[lane_id * scale_stride] = scale_0 : 0.0f;
-                (lane_id + kWarpSize) < num_scales ? dst_scales[(lane_id + kWarpSize) * scale_stride] = scale_1 : 0.0f;
+                const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
+                const auto token_idx = recv_token_begin_idx + i;
+                const auto token_stride = num_elems_per_pack;
+                const auto pack_stride = num_ranks * num_max_dispatch_tokens_per_rank * num_elems_per_pack;
+                if (lane_id < num_scales) {
+                    const auto pack_idx = lane_id / num_elems_per_pack;
+                    const auto elem_idx = lane_id % num_elems_per_pack;
+                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id));
+                    recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
+                }
+
+                if (lane_id + kWarpSize < num_scales) {
+                    const auto pack_idx = (lane_id + kWarpSize) / num_elems_per_pack;
+                    const auto elem_idx = (lane_id + kWarpSize) % num_elems_per_pack;
+                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + kWarpSize));
+                    recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
+                }
+
             }
         }
     }
@@ -452,16 +486,37 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 #endif
 }
 
-void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
-              int* packed_recv_src_info, int64_t* packed_recv_layout_range,
+
+void dispatch(void* packed_recv_x,
+              void*  packed_recv_x_scales,
+              int* packed_recv_src_info,
+              int64_t* packed_recv_layout_range,
               int* packed_recv_count,
-              int* global_atomic_counter,
-              void* rdma_recv_x, int64_t* rdma_recv_count, void* rdma_x,
-              const void* x, const int64_t* topk_idx,
-              int64_t* next_clean, int num_next_clean_int,
-              int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
-              int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-              void* workspace, cudaStream_t stream, int phases) {
+              int* mask_buffer_ptr,
+              int* cumulative_local_expert_recv_stats,
+              int64_t* dispatch_wait_recv_cost_stats,
+              void* rdma_recv_x,
+              int64_t* rdma_recv_count,
+              void* rdma_x,
+              const void* x,
+              const topk_idx_t* topk_idx,
+              int64_t* next_clean,
+              int num_next_clean_int,
+              int num_tokens,
+              int hidden,
+              int num_max_dispatch_tokens_per_rank,
+              int num_topk,
+              int num_experts,
+              int rank,
+              int num_ranks,
+              bool use_fp8,
+              bool round_scale,
+              bool use_ue8m0,
+              void* workspace,
+              int num_device_sms,
+              cudaStream_t stream,
+              int phases,
+              int* global_atomic_counter) {
 
 #ifdef USE_ROCM
     constexpr int kNumWarpsPerGroup = 8;
@@ -481,28 +536,51 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
+        // FP8 checks
+    if (use_ue8m0)
+        EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
+
+    static_assert(sizeof(topk_idx_t) == sizeof(int64_t),
+                  "internode_ll::dispatch requires 64-bit topk indices");
+    const int64_t* topk_idx_64 = reinterpret_cast<const int64_t*>(topk_idx);
 
     bool kMultinode = (num_ranks > 8);
 #define DISPATCH_LAUNCH_CASE(hidden) { \
-  auto dispatch_func =                                                                      \
-    use_fp8                                                                                 \
-      ? ( kMultinode                                                                          \
-            ? dispatch<true,  true,  kNumWarpGroups, kNumWarpsPerGroup, hidden>            \
-            : dispatch<true,  false, kNumWarpGroups, kNumWarpsPerGroup, hidden> )          \
-      : ( kMultinode                                                                          \
-            ? dispatch<false, true,  kNumWarpGroups, kNumWarpsPerGroup, hidden>            \
-            : dispatch<false, false, kNumWarpGroups, kNumWarpsPerGroup, hidden> );\
+auto dispatch_func =   \
+  use_fp8   \
+    ? ( use_ue8m0   \
+          ? ( round_scale   \
+                ? ( kMultinode    \
+                      ? dispatch<true,  true,  true,  \
+                                 kNumWarpGroups, kNumWarpsPerGroup, hidden>   \
+                      : dispatch<true,  true,  false, \
+                                 kNumWarpGroups, kNumWarpsPerGroup, hidden> ) \
+                : ( kMultinode    \
+                      ? dispatch<true,  false, true,  \
+                                 kNumWarpGroups, kNumWarpsPerGroup, hidden>   \
+                      : dispatch<true,  false, false, \
+                                 kNumWarpGroups, kNumWarpsPerGroup, hidden> ) ) \
+          : ( kMultinode    \
+                ? dispatch<true,  false, true,  \
+                           kNumWarpGroups, kNumWarpsPerGroup, hidden>   \
+                : dispatch<true,  false, false, \
+                           kNumWarpGroups, kNumWarpsPerGroup, hidden> ) )   \
+    : ( kMultinode  \
+          ? dispatch<false, false, true,    \
+                     kNumWarpGroups, kNumWarpsPerGroup, hidden> \
+          : dispatch<false, false, false,   \
+                     kNumWarpGroups, kNumWarpsPerGroup, hidden> );  \
 LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
               packed_recv_count, \
               global_atomic_counter, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
-              x, topk_idx, \
+              x, topk_idx_64, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean, num_next_clean_int, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
-              num_topk, num_experts, rank, num_ranks, phases);} break
+              num_topk, num_experts, rank, num_ranks, phases, round_scale);} break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * kWarpSize, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
@@ -526,7 +604,7 @@ combine(void* combined_x,
 #if !defined(ROCM_DISABLE_CTX)
     __shared__ internode::shmem_ctx_t ctx;
     if constexpr(kMultinode)
-        internode::shmem_wg_ctx_create(&ctx);
+        EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0 or ctx == ROCSHMEM_CTX_INVALID);
 #endif
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -612,14 +690,17 @@ combine(void* combined_x,
                     internode::shmem_ctx_schar_put_nbi_warp(ctx,reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
 #endif
                 }
-                if constexpr (kMultinode){
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmem_fence();
-#else
-                    internode::shmem_ctx_quiet(ctx);
-#endif
-                }
+
             }
+        }
+
+        if constexpr (kMultinode){
+            if (sub_warp_id == 0)
+#if defined(ROCM_DISABLE_CTX)
+                internode::shmem_fence();
+#else
+                internode::shmem_ctx_quiet(ctx);
+#endif
         }
 
         // Put finishing flag
@@ -641,6 +722,7 @@ combine(void* combined_x,
                 if constexpr (!kMultinode){
                     rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
                 } else {
+                    __threadfence_system();
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #else
@@ -654,14 +736,6 @@ combine(void* combined_x,
                 st_na_release(reinterpret_cast<int64_t*>(rdma_recv_flag + global_expert_idx), 1);
             }
             atomic_add_relaxed_global(atomic_clean_flag, -1);
-                if constexpr (kMultinode){
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmem_fence();
-#else
-                    internode::shmem_ctx_quiet(ctx);
-#endif
-                }
-
         }
     }
 
@@ -733,15 +807,33 @@ combine(void* combined_x,
 }
 
 void combine(void* combined_x,
-             void* rdma_recv_x, int64_t* rdma_recv_flag, void* rdma_send_x,
-             const void* x, const int64_t* topk_idx, const float* topk_weights,
-             const int* src_info, const int64_t* layout_range,
-             int* global_atomic_counter,
-             int64_t* next_clean, int num_next_clean_int,
-             int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
-             int num_topk, int num_experts, int rank, int num_ranks,
-             void* workspace, cudaStream_t stream,
-             int phases, bool zero_copy) {
+             void* rdma_recv_x,
+             int64_t* rdma_recv_flag,
+             void* rdma_send_x,
+             const void* x,
+             const topk_idx_t* topk_idx,
+             const float* topk_weights,
+             const int* src_info,
+             const int64_t* layout_range,
+             int* mask_buffer_ptr,
+             int64_t* combine_wait_recv_cost_stats,
+             int64_t* next_clean,
+             int num_next_clean_int,
+             int num_combined_tokens,
+             int hidden,
+             int num_max_dispatch_tokens_per_rank,
+             int num_topk,
+             int num_experts,
+             int rank,
+             int num_ranks,
+             bool use_logfmt,
+             void* workspace,
+             int num_device_sms,
+             cudaStream_t stream,
+             int phases,
+             bool zero_copy,
+             int* global_atomic_counter = NULL) {
+
 #ifdef USE_ROCM
     constexpr int kNumWarpsPerGroup = 8;
     constexpr int kNumWarpGroups = 2;
@@ -778,6 +870,57 @@ LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, combine_func, \
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
+
+
+template <int kNumThreads>
+__launch_bounds__(kNumThreads, 1) __global__ void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* mask_tensor) {
+    const auto num_sms = static_cast<int>(gridDim.x);
+    const auto sm_id = static_cast<int>(blockIdx.x);
+    const auto num_threads = num_sms * kNumThreads;
+    const auto thread_id = sm_id * kNumThreads + static_cast<int>(threadIdx.x);
+    for (int rank_id = thread_id; rank_id < num_ranks; rank_id += num_threads) {
+        mask_tensor[rank_id] = mask_buffer_ptr[rank_id];
+    }
+}
+
+void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* mask_tensor, cudaStream_t stream) {
+    constexpr int num_sms = 1;
+    constexpr int kNumThreads = 1024;
+    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+    LAUNCH_KERNEL(&cfg, query_mask_buffer<kNumThreads>, mask_buffer_ptr, num_ranks, mask_tensor);
+}
+
+template <int kNumThreads>
+__launch_bounds__(kNumThreads, 1) __global__ void update_mask_buffer(int* mask_buffer_ptr, int rank_to_mask, bool mask) {
+    const auto sm_id = static_cast<int>(blockIdx.x);
+    const auto thread_id = static_cast<int>(threadIdx.x);
+    if (sm_id == 0 && thread_id == 0) {
+        atomicExch(mask_buffer_ptr + rank_to_mask, mask ? 1 : 0);
+    }
+}
+
+void update_mask_buffer(int* mask_buffer_ptr, int rank, bool mask, cudaStream_t stream) {
+    constexpr int num_sms = 1;
+    constexpr int kNumThreads = 32;
+    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+    LAUNCH_KERNEL(&cfg, update_mask_buffer<kNumThreads>, mask_buffer_ptr, rank, mask);
+}
+
+template <int kNumThreads>
+__launch_bounds__(kNumThreads, 1) __global__ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks) {
+    auto thread_id = static_cast<int>(threadIdx.x);
+    #pragma unroll
+    for (int i = thread_id; i < num_ranks; i += kNumThreads)
+        mask_buffer_ptr[i] = 0;
+}
+
+void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream) {
+    constexpr int num_sms = 1;
+    constexpr int kNumThreads = 32;
+    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+    LAUNCH_KERNEL(&cfg, clean_mask_buffer<kNumThreads>, mask_buffer_ptr, num_ranks);
+}
+
 
 } // namespace internode_ll
 

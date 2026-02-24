@@ -100,10 +100,30 @@ if __name__ == "__main__":
     if variant == "rocm":
         arch = os.getenv("PYTORCH_ROCM_ARCH")
         allowed_arch = {"gfx942", "gfx950"}
-        if arch not in allowed_arch:
-            raise EnvironmentError(
-                f"Invalid PYTORCH_ROCM_ARCH='{arch}'. "
-                f"Use one of: {', '.join(sorted(allowed_arch))}.")
+
+        arch_env = os.getenv("PYTORCH_ROCM_ARCH", "").strip()
+        if not arch_env:
+            # Default: build for both MI300 (gfx942) and gfx950
+            arch_list = ["gfx942", "gfx950"]
+            os.environ["PYTORCH_ROCM_ARCH"] = ";".join(arch_list)
+            print(f"PYTORCH_ROCM_ARCH not set; defaulting to '{os.environ['PYTORCH_ROCM_ARCH']}'")
+        else:
+            # Support lists like "gfx942;gfx950" or "gfx942,gfx950"
+            raw_list = [a.strip() for a in arch_env.replace(",", ";").split(";") if a.strip()]
+            keep = [a for a in raw_list if a in allowed_arch]
+
+            if not keep:
+                raise EnvironmentError(
+                    f"Invalid PYTORCH_ROCM_ARCH='{arch_env}'. "
+                    f"DeepEP ROCm build supports only: {', '.join(sorted(allowed_arch))}."
+                )
+
+            # Override env to only supported archs (avoids build explosion / unsupported gfx*)
+            new_env = ";".join(dict.fromkeys(keep))  # de-dup, preserve order
+            if new_env != arch_env:
+                print(f"Filtering PYTORCH_ROCM_ARCH from '{arch_env}' to '{new_env}' (DeepEP supports only gfx942/gfx950)")
+                os.environ["PYTORCH_ROCM_ARCH"] = new_env
+
     elif variant == "cuda":
         os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
@@ -151,6 +171,7 @@ if __name__ == "__main__":
     sources = [
         "csrc/deep_ep.cpp",
         "csrc/kernels/runtime.cu",
+        'csrc/kernels/layout.cu',
         "csrc/kernels/intranode.cu",
         "csrc/kernels/internode.cu",
         "csrc/kernels/internode_ll.cu",

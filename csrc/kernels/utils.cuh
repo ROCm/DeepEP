@@ -795,4 +795,107 @@ barrier_device(int **task_fifo_ptrs, int head, int rank, int tag = 0) {
     timeout_check<kNumRanks>(task_fifo_ptrs, head, rank, 0, tag);
 }
 
+template <bool kIsUE8M0,
+          typename out_dtype_t = std::conditional_t<kIsUE8M0, uint8_t, float>>
+__forceinline__ __device__ out_dtype_t
+extract_required_scale_format(float value) {
+  if constexpr (kIsUE8M0) {
+    return static_cast<uint8_t>((*reinterpret_cast<uint32_t*>(&value)) >> 23);
+  } else {
+    return value;
+  }
+}
+
+#ifdef USE_ROCM 
+constexpr float kFP8Margin = 1e-4;
+constexpr float kFinfoAmaxE4M3 = 240.0f;
+constexpr float kFinfoAmaxInvE4M3 = 1 / 240.0f;
+#else
+constexpr float kFP8Margin = 1e-4;
+constexpr float kFinfoAmaxE4M3 = 448.0f;
+constexpr float kFinfoAmaxInvE4M3 = 1 / 448.0f;
+#endif
+
+__forceinline__ __device__ float fast_pow2(int x) {
+    // We can ensure `-126 <= x and x <= 127`
+    uint32_t bits_x = (x + 127) << 23;
+    return *reinterpret_cast<float*>(&bits_x);
+}
+
+__forceinline__ __device__ int fast_log2_ceil(float x) {
+    auto bits_x = *reinterpret_cast<uint32_t*>(&x);
+    auto exp_x = (bits_x >> 23) & 0xff;
+    auto man_bits = bits_x & ((1 << 23) - 1);
+    return exp_x - 127 + (man_bits != 0);
+}
+
+__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv, bool round_scale) {
+    if (round_scale) {
+        auto exp_scale_inv = fast_log2_ceil(amax * kFinfoAmaxInvE4M3);
+        scale = fast_pow2(-exp_scale_inv);
+        scale_inv = fast_pow2(exp_scale_inv);
+    } else {
+        
+        scale_inv = amax * kFinfoAmaxInvE4M3;
+        scale = kFinfoAmaxE4M3 / amax;
+    }
+}
+
+template <int kNumRanks, bool kSyncOnly = false>
+__forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {
+    auto thread_id = static_cast<int>(threadIdx.x);
+
+    // For non-sync-only cases, the memory operations by other threads in the block must be visible to the `sys` scope
+    if constexpr (not kSyncOnly) {
+        memory_fence();
+        __syncthreads();
+    }
+
+    // Add self-ranks, sub other ranks
+    if (thread_id < kNumRanks) {
+        atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
+        atomicSub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
+    }
+    EP_DEVICE_ASSERT(kNumRanks <= blockDim.x);
+
+    // Check timeout
+    auto start_time = wall_clock64();
+    while (true) {
+        auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
+        if (__all_sync(kFullWarpMask, value <= 0))
+            break;
+
+        if (wall_clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
+            printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value);
+            trap();
+        }
+    }
+    __syncthreads();
+}
+
+
+__device__ __forceinline__ uint32_t elect_one_sync() {
+#ifndef DISABLE_SM90_FEATURES
+    uint32_t pred = 0;
+    asm volatile(
+        "{\n"
+        ".reg .b32 %%rx;\n"
+        ".reg .pred %%px;\n"
+        "      elect.sync %%rx|%%px, %1;\n"
+        "@%%px mov.s32 %0, 1;\n"
+        "}\n"
+        : "+r"(pred)
+        : "r"(0xffffffff));
+    return pred;
+#else
+    return get_lane_id() == 0;
+#endif
+}
+
 } // namespace deep_ep
+
+template <typename dtype_t>
+__host__ __device__ constexpr dtype_t align_down(dtype_t a, dtype_t b) {
+    return a / b * b;
+}
+
