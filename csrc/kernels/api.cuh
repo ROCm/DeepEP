@@ -7,7 +7,7 @@ namespace deep_ep {
 // Intranode runtime
 namespace intranode {
 
-void barrier(int **task_fifo_ptrs, int rank, int num_ranks, cudaStream_t stream, int head = 0);
+void barrier(int **barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream);
 
 } // namespace intranode
 
