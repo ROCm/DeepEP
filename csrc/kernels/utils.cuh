@@ -598,10 +598,11 @@ __forceinline__ __device__ int get_lane_id() {
 }
 
 __device__ __forceinline__ uint32_t elect_one_sync() {
-#ifndef DISABLE_SM90_FEATURES
+
 #ifdef USE_ROCM
     return get_lane_id() == 0;
 #else
+#ifndef DISABLE_SM90_FEATURES
     uint32_t pred = 0;
     asm volatile(
         "{\n"
@@ -613,9 +614,9 @@ __device__ __forceinline__ uint32_t elect_one_sync() {
         : "+r"(pred)
         : "r"(0xffffffff));
     return pred;
-#endif
 #else
     return get_lane_id() == 0;
+#endif
 #endif
 }
 
@@ -807,9 +808,15 @@ __device__ __forceinline__ dtype_t broadcast(dtype_t& ptr, int src_lane_idx) {
     return *reinterpret_cast<dtype_t*>(recv_int_values);
 }
 
+#ifdef USE_ROCM 
+constexpr float kFP8Margin = 1e-4;
+constexpr float kFinfoAmaxE4M3 = 240.0f;
+constexpr float kFinfoAmaxInvE4M3 = 1 / 240.0f;
+#else
 constexpr float kFP8Margin = 1e-4;
 constexpr float kFinfoAmaxE4M3 = 448.0f;
 constexpr float kFinfoAmaxInvE4M3 = 1 / 448.0f;
+#endif
 
 __forceinline__ __device__ float fast_pow2(int x) {
     // We can ensure `-126 <= x and x <= 127`
