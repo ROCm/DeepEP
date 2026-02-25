@@ -1,7 +1,14 @@
 #pragma once
 
+#ifdef USE_ROCM
+#include "kernels/exception_hip.cuh"
+#include "kernels/api_hip.cuh"
+#include "kernels/launch_hip.cuh"
+#else
 #include "kernels/api.cuh"
 #include "kernels/exception.cuh"
+#include "kernels/launch.cuh"
+#endif
 
 namespace deep_ep {
 
@@ -13,6 +20,12 @@ dtype_t ceil_div(dtype_t a, dtype_t b) {
 template <typename dtype_t>
 dtype_t align_up(dtype_t a, dtype_t b) {
     return ceil_div<dtype_t>(a, b) * b;
+}
+//TODO:: remove
+// Alias for align_up (for compatibility)
+template <typename dtype_t>
+dtype_t align(dtype_t a, dtype_t b) {
+    return align_up<dtype_t>(a, b);
 }
 
 template <typename dtype_t>
@@ -28,15 +41,22 @@ struct Config {
     int num_max_rdma_chunked_recv_tokens;
 
     Config(int num_sms,
-           int num_max_nvl_chunked_send_tokens,
-           int num_max_nvl_chunked_recv_tokens,
-           int num_max_rdma_chunked_send_tokens,
-           int num_max_rdma_chunked_recv_tokens)
-        : num_sms(num_sms),
-          num_max_nvl_chunked_send_tokens(num_max_nvl_chunked_send_tokens),
-          num_max_nvl_chunked_recv_tokens(num_max_nvl_chunked_recv_tokens),
-          num_max_rdma_chunked_send_tokens(num_max_rdma_chunked_send_tokens),
-          num_max_rdma_chunked_recv_tokens(num_max_rdma_chunked_recv_tokens) {
+           int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
+           int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens) :
+            num_sms(num_sms),
+            num_max_nvl_chunked_send_tokens(num_max_nvl_chunked_send_tokens),
+            num_max_nvl_chunked_recv_tokens(num_max_nvl_chunked_recv_tokens),
+            num_max_rdma_chunked_send_tokens(num_max_rdma_chunked_send_tokens),
+            num_max_rdma_chunked_recv_tokens(num_max_rdma_chunked_recv_tokens) {
+        //    int num_max_nvl_chunked_send_tokens,
+        //    int num_max_nvl_chunked_recv_tokens,
+        //    int num_max_rdma_chunked_send_tokens,
+        //    int num_max_rdma_chunked_recv_tokens)
+        // : num_sms(num_sms),
+        //   num_max_nvl_chunked_send_tokens(num_max_nvl_chunked_send_tokens),
+        //   num_max_nvl_chunked_recv_tokens(num_max_nvl_chunked_recv_tokens),
+        //   num_max_rdma_chunked_send_tokens(num_max_rdma_chunked_send_tokens),
+        //   num_max_rdma_chunked_recv_tokens(num_max_rdma_chunked_recv_tokens) {
         EP_HOST_ASSERT(num_sms >= 0);
         EP_HOST_ASSERT(num_max_nvl_chunked_send_tokens > 0 and num_max_nvl_chunked_recv_tokens > 0);
         EP_HOST_ASSERT(num_max_nvl_chunked_send_tokens < num_max_nvl_chunked_recv_tokens);
@@ -64,9 +84,10 @@ struct Config {
         num_bytes += num_channels * num_nvl_ranks * (2 * num_rdma_ranks + 3) * sizeof(int);
         num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * hidden_bytes;
 #ifndef DISABLE_NVSHMEM
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * internode::get_source_meta_bytes();
+        //num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * internode::get_source_meta_bytes();
+        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxTopK * sizeof(int64_t) * 2;
 #endif
-        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK * sizeof(topk_idx_t);
+        num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK * sizeof(int64_t);
         num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK * sizeof(float);
         num_bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxScales * sizeof(float);
         num_bytes = ((num_bytes + 127) / 128) * 128;
@@ -91,8 +112,9 @@ struct Config {
         size_t num_bytes = 0;
         num_bytes += num_channels * num_rdma_ranks * (NUM_MAX_NVL_PEERS * 2 + 2) * 2 * sizeof(int);
         num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * hidden_bytes * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * internode::get_source_meta_bytes() * 2;
-        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxTopK * sizeof(topk_idx_t) * 2;
+        //num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * internode::get_source_meta_bytes() * 2;
+        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxTopK * sizeof(int64_t) * 2;
+        num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxTopK * sizeof(int64_t) * 2;
         num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxTopK * sizeof(float) * 2;
         num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxScales * sizeof(float) * 2;
         num_bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * sizeof(int4) * 2;
@@ -109,16 +131,32 @@ struct LowLatencyBuffer {
 
     void* dispatch_rdma_send_buffer = nullptr;
     void* dispatch_rdma_recv_data_buffer = nullptr;
+#ifdef USE_ROCM
+    int64_t* dispatch_rdma_recv_count_buffer = nullptr;
+#else
     int* dispatch_rdma_recv_count_buffer = nullptr;
+#endif
 
     void* combine_rdma_send_buffer = nullptr;
     void* combine_rdma_recv_data_buffer = nullptr;
+#ifdef USE_ROCM
+    int64_t* combine_rdma_recv_flag_buffer = nullptr;
+#else 
     int* combine_rdma_recv_flag_buffer = nullptr;
+#endif
 
     void* combine_rdma_send_buffer_data_start = nullptr;
     size_t num_bytes_per_combine_msg = 0;
+#ifdef USE_ROCM
+    size_t nvl_recv_data_buffer_offset = 0;
+    size_t nvl_recv_count_buffer_offset = 0;
+#endif
 
+#ifdef USE_ROCM
+    std::pair<int64_t*, int> clean_meta() {
+#else
     std::pair<int*, int> clean_meta() {
+#endif
         EP_HOST_ASSERT(dispatch_rdma_recv_count_buffer == combine_rdma_recv_flag_buffer);
         return {dispatch_rdma_recv_count_buffer, num_clean_int};
     }
@@ -145,8 +183,12 @@ struct LowLatencyLayout {
         // NOTES: you should add a control `int4` for combine messages if you want to do data transformation
         // NOTES: `num_scales * sizeof(nv_bfloat162)` means the per-128-channel min/max
         EP_HOST_ASSERT(num_scales * sizeof(float) <= hidden);
-        size_t num_bytes_per_dispatch_msg = sizeof(int4) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
+        size_t num_bytes_per_dispatch_msg = sizeof(int4) + std::max(hidden * sizeof(gpu_bfloat16_t), hidden + num_scales * sizeof(float));
+#ifdef USE_ROCM
+        size_t num_bytes_per_combine_msg = sizeof(int4) + hidden * sizeof(gpu_bfloat16_t);
+#else
         size_t num_bytes_per_combine_msg = num_scales * sizeof(nv_bfloat162) + hidden * sizeof(nv_bfloat16);
+#endif
 
         // Send buffer
         size_t dispatch_send_buffer_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
@@ -164,7 +206,11 @@ struct LowLatencyLayout {
         total_bytes += recv_buffer_bytes * 2;
 
         // Symmetric signaling buffers
+#ifdef USE_ROCM
+        size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int64_t);
+#else
         size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int);
+#endif
         size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
         size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
         size_t signaling_buffer_bytes_aligned = align_up<size_t>(signaling_buffer_bytes, 128);
@@ -174,6 +220,20 @@ struct LowLatencyLayout {
         // NOTES: we still leave some space for distinguishing dispatch/combine buffer,
         // so you may see some parameters are duplicated
         for (int i = 0; i < 2; ++i) {
+#ifdef USE_ROCM
+            buffers[i] = {
+                static_cast<int>(signaling_buffer_bytes / sizeof(int64_t)),
+                advance(rdma_buffer, send_buffer_bytes * i),
+                advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i),
+                advance<int64_t*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes_aligned * i),
+                advance(rdma_buffer, send_buffer_bytes * i),
+                advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i),
+                advance<int64_t*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes_aligned * i),
+                advance(rdma_buffer, send_buffer_bytes * i + sizeof(int4)),
+                num_bytes_per_combine_msg,
+                send_buffer_bytes * 2 + recv_buffer_bytes * i,
+                send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes_aligned * i};
+#else
             buffers[i] = {static_cast<int>(signaling_buffer_bytes / sizeof(int)),
                           advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
                           advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 + recv_buffer_bytes * i),
@@ -183,11 +243,12 @@ struct LowLatencyLayout {
                           advance<int*>(rdma_buffer, signaling_buffer_bytes_aligned * i),
                           advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
                           num_bytes_per_combine_msg};
+#endif
         }
     }
 };
 
-size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
+inline size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
     auto num_bytes = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes;
     return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }
