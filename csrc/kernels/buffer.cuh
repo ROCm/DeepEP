@@ -11,7 +11,11 @@ private:
     uint8_t* ptr;
 
 public:
+#ifdef USE_ROCM
     int64_t total_bytes;
+#else
+    int total_bytes;
+#endif
 
     __device__ __forceinline__ Buffer() : ptr(nullptr), total_bytes(0) {}
 
@@ -35,16 +39,28 @@ template <typename dtype_t, int kNumRanks = 1>
 struct AsymBuffer {
 private:
     uint8_t* ptrs[kNumRanks];
+#ifdef USE_ROCM
     int64_t num_bytes;
+#else
+    int num_bytes;
+#endif
 
 public:
+#ifdef USE_ROCM
     int64_t total_bytes;
+#else
+    int total_bytes;
+#endif
 
     __device__ __forceinline__ AsymBuffer(void*& gbl_ptr, int num_elems, int num_ranks, int sm_id = 0, int num_sms = 1, int offset = 0) {
         EP_STATIC_ASSERT(kNumRanks == 1, "");
         num_bytes = num_elems * sizeof(dtype_t);
 
+#ifdef USE_ROCM
         int64_t per_channel_bytes = num_bytes * num_ranks;
+#else
+        int per_channel_bytes = num_bytes * num_ranks;
+#endif
         total_bytes = per_channel_bytes * num_sms;
         ptrs[0] = static_cast<uint8_t*>(gbl_ptr) + per_channel_bytes * sm_id + num_bytes * offset;
         gbl_ptr = static_cast<uint8_t*>(gbl_ptr) + total_bytes;
@@ -54,7 +70,11 @@ public:
         EP_STATIC_ASSERT(kNumRanks > 1, "");
         num_bytes = num_elems * sizeof(dtype_t);
 
+#ifdef USE_ROCM
         int64_t per_channel_bytes = num_bytes * num_ranks;
+#else
+        int per_channel_bytes = num_bytes * num_ranks;
+#endif
         total_bytes = per_channel_bytes * num_sms;
         for (int i = 0; i < kNumRanks; ++i) {
             ptrs[i] = static_cast<uint8_t*>(gbl_ptrs[i]) + per_channel_bytes * sm_id + num_bytes * offset;
@@ -97,15 +117,27 @@ private:
     // NOTES: for non-decoupled case, `recv_ptr` is not used
     uint8_t* send_ptr;
     uint8_t* recv_ptr;
+#ifdef USE_ROCM
     int64_t num_bytes;
+#else
+    int num_bytes;
+#endif
 
 public:
+#ifdef USE_ROCM
     int64_t total_bytes;
+#else
+    int total_bytes;
+#endif
 
     __device__ __forceinline__ SymBuffer(void*& gbl_ptr, int num_elems, int num_ranks, int sm_id = 0, int num_sms = 1) {
         num_bytes = num_elems * sizeof(dtype_t);
 
+#ifdef USE_ROCM
         int64_t per_channel_bytes = num_bytes * num_ranks;
+#else
+        int per_channel_bytes = num_bytes * num_ranks;
+#endif
         total_bytes = per_channel_bytes * num_sms * (static_cast<int>(kDecoupled) + 1);
         send_ptr = static_cast<uint8_t*>(gbl_ptr) + per_channel_bytes * sm_id;
         recv_ptr = static_cast<uint8_t*>(gbl_ptr) + per_channel_bytes * (sm_id + num_sms);
