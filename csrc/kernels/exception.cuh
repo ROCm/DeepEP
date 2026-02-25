@@ -53,11 +53,21 @@ public:
 #endif
 
 #ifndef EP_DEVICE_ASSERT
-#define EP_DEVICE_ASSERT(cond)                                                             \
-    do {                                                                                   \
-        if (not(cond)) {                                                                   \
-            printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
-            asm("trap;");                                                                  \
-        }                                                                                  \
-    } while (0)
+#if defined(USE_ROCM)
+#define EP_DEVICE_ASSERT(cond) \
+do { \
+    if (not (cond)) { \
+        printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
+        abort();\
+    } \
+} while (0)
+#else
+#define EP_DEVICE_ASSERT(cond) \
+do { \
+    if (not (cond)) { \
+        printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
+        asm("trap;"); \
+    } \
+} while (0)
+#endif // #if defined(USE_ROCM)
 #endif
