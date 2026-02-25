@@ -2,33 +2,34 @@
 
 #include <vector>
 
-#include "configs.cuh"
-
 namespace deep_ep {
 
 // Intranode runtime
 namespace intranode {
 
-void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream);
+void barrier(int **task_fifo_ptrs, int rank, int num_ranks, cudaStream_t stream, int head = 0);
 
-}  // namespace intranode
+} // namespace intranode
 
 // Internode runtime
+
 namespace internode {
 
 std::vector<uint8_t> get_unique_id();
 
-int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks, bool low_latency_mode);
 
-void* alloc(size_t size, size_t alignment);
+int init(const std::vector<uint8_t> &root_unique_id_val, int rank, int num_ranks, bool low_latency_mode);
 
-void free(void* ptr);
+void *alloc(size_t size, size_t alignment);
+
+void free(void *ptr);
 
 void barrier();
 
 void finalize();
 
-}  // namespace internode
+} // namespace internode
+
 
 // Layout kernels
 namespace layout {
@@ -45,6 +46,7 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
                          cudaStream_t stream);
 
 }  // namespace layout
+
 
 // Intranode kernels
 namespace intranode {
@@ -119,8 +121,6 @@ void combine(cudaDataType_t type,
              float* recv_topk_weights,
              const void* x,
              const float* topk_weights,
-             const void* bias_0,
-             const void* bias_1,
              const int* src_idx,
              const int* rank_prefix_matrix,
              const int* channel_prefix_matrix,
@@ -137,12 +137,19 @@ void combine(cudaDataType_t type,
              int num_max_send_tokens,
              int num_recv_buffer_tokens);
 
-}  // namespace intranode
+} // namespace intranode
 
 // Internode kernels
 namespace internode {
 
 int get_source_meta_bytes();
+
+
+void get_dispatch_layout(const int64_t* topk_idx,
+                         int* num_tokens_per_rank, int* num_tokens_per_rdma_rank,
+                         int* num_tokens_per_expert, bool* is_token_in_rank,
+                         int num_tokens, int num_topk, int num_ranks, int num_experts,
+                         cudaStream_t stream);
 
 void notify_dispatch(const int* num_tokens_per_rank,
                      int* moe_recv_counter_mapped,
@@ -154,7 +161,6 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int num_experts,
                      const bool* is_token_in_rank,
                      int num_tokens,
-                     int num_worst_tokens,
                      int num_channels,
                      int hidden_int4,
                      int num_scales,
@@ -173,7 +179,8 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      cudaStream_t stream,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
-                     bool low_latency_mode);
+                     bool low_latency_mode,
+                     int head = 0);
 
 void dispatch(void* recv_x,
               float* recv_x_scales,
@@ -194,7 +201,6 @@ void dispatch(void* recv_x,
               const int* recv_gbl_rank_prefix_sum,
               const bool* is_token_in_rank,
               int num_tokens,
-              int num_worst_tokens,
               int hidden_int4,
               int num_scales,
               int num_topk,
@@ -235,7 +241,9 @@ void cached_notify(int hidden_int4,
                    int64_t num_rdma_bytes,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
-                   bool low_latency_mode);
+                   bool low_latency_mode,
+                   int head = 0);
+
 
 void combine(cudaDataType_t type,
              void* combined_x,
@@ -265,21 +273,22 @@ void combine(cudaDataType_t type,
              int num_ranks,
              cudaStream_t stream,
              int num_channels,
-             bool low_latency_mode);
+             bool low_latency_mode); 
 
-}  // namespace internode
+} // namespace internode
 
+#if !DISABLE_INTERNODE
 // Internode low-latency kernels
 namespace internode_ll {
 
-void clean_low_latency_buffer(int* clean_0,
+void clean_low_latency_buffer(int64_t* clean_0,
                               int num_clean_int_0,
-                              int* clean_1,
+                              int64_t* clean_1,
                               int num_clean_int_1,
                               int rank,
                               int num_ranks,
-                              int* mask_buffer,
-                              int* sync_buffer,
+                              int* mask_buffer_ptr,
+                              int* sync_buffer_ptr,
                               cudaStream_t stream);
 
 void dispatch(void* packed_recv_x,
@@ -287,15 +296,15 @@ void dispatch(void* packed_recv_x,
               int* packed_recv_src_info,
               int64_t* packed_recv_layout_range,
               int* packed_recv_count,
-              int* mask_buffer,
+              int* mask_buffer_ptr,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
               void* rdma_recv_x,
-              int* rdma_recv_count,
+              int64_t* rdma_recv_count,
               void* rdma_x,
               const void* x,
               const topk_idx_t* topk_idx,
-              int* next_clean,
+              int64_t* next_clean,
               int num_next_clean_int,
               int num_tokens,
               int hidden,
@@ -310,20 +319,24 @@ void dispatch(void* packed_recv_x,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
-              int phases);
+              int phases
+#ifdef USE_ROCM
+              ,int* global_atomic_counter = nullptr
+#endif
+            );
 
 void combine(void* combined_x,
              void* rdma_recv_x,
-             int* rdma_recv_flag,
+             int64_t* rdma_recv_flag,
              void* rdma_send_x,
              const void* x,
              const topk_idx_t* topk_idx,
              const float* topk_weights,
              const int* src_info,
              const int64_t* layout_range,
-             int* mask_buffer,
+             int* mask_buffer_ptr,
              int64_t* combine_wait_recv_cost_stats,
-             int* next_clean,
+             int64_t* next_clean,
              int num_next_clean_int,
              int num_combined_tokens,
              int hidden,
@@ -337,14 +350,19 @@ void combine(void* combined_x,
              int num_device_sms,
              cudaStream_t stream,
              int phases,
-             bool zero_copy);
+             bool zero_copy
+#ifdef USE_ROCM
+              ,int* global_atomic_counter = nullptr
+#endif
+);
 
 void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
 
 void update_mask_buffer(int* mask_buffer_ptr, int rank_to_mask, bool mask, cudaStream_t stream);
 
-void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream);
+void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream);             
 
-}  // namespace internode_ll
+} // namespace internode_ll
+#endif
 
-}  // namespace deep_ep
+} // namespace deep_ep
