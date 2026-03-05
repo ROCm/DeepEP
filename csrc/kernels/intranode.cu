@@ -330,9 +330,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         // NOTES: this is for distinguishing zero tokens
         if (send_lane_id == 0 and send_warp_id_in_rank == 0) {
             int value = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
-            st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
+            st_release_sys_global(channel_start_offset.buffer(), -value - 1);
             value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
-            st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1);
+            st_release_sys_global(channel_end_offset.buffer(), -value - 1);
         }
         syncwarp();
 
@@ -431,11 +431,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
 #endif
             if (send_warp_id_in_rank == 0 and send_lane_id == 0)
-#if defined(USE_ROCM)
-                st_relaxed_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
-#else
                 st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
-#endif
         }
     } else {
         // Workers for receiving and copying into buffer
@@ -474,11 +470,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         while (num_tokens_to_recv > 0) {
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by different warps are the same
             while (recv_thread_id_in_rank == 0) {
-#if defined(USE_ROCM)
-                cached_channel_tail_idx = ld_relaxed_sys_global(channel_tail_idx.buffer());
-#else
                 cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
-#endif
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
@@ -578,7 +570,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
 #endif
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and recv_lane_id == 0)
-                st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
+                st_release_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
 
             // Exit
             num_tokens_to_recv -= num_recv_tokens;
@@ -873,11 +865,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             asm volatile("bar.sync %0, %1;" :: "r"(send_rank_id), "r"(num_threads_per_rank));
 #endif
             if (lane_id == 0 and send_warp_id_in_rank == 0)
-#if defined(USE_ROCM)
-                st_relaxed_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
-#else
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
-#endif
         }
     } else {
         // Workers for receiving
@@ -918,11 +906,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     break;
 
                 // Update queue tail
-#if defined(USE_ROCM)
-                channel_tail_idx[lane_id] = ld_relaxed_sys_global(channel_tail_idx_ptr);
-#else
                 channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr);
-#endif
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
@@ -930,7 +914,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 for (int i = 1; i < num_recv_warps; ++ i) if (not warp_retired[i])
                     min_head = min(min_head, warp_channel_head_idx[i][lane_id]);
                 if (min_head != std::numeric_limits<int>::max() and min_head > last_head)
-                    st_relaxed_sys_global(channel_head_idx_ptr, last_head = min_head);
+                    st_release_sys_global(channel_head_idx_ptr, last_head = min_head);
             }
         } else {
             // Receivers
