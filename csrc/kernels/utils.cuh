@@ -879,7 +879,7 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
     auto start_time = clock64();
     while (true) {
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
-        if (__all_sync(kFullWarpMask, value <= 0))
+        if (__all_sync(0xffffffff, value <= 0))
             break;
 
         if (clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {

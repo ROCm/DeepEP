@@ -142,8 +142,11 @@ Buffer::Buffer(int rank,
       enable_shrink(enable_shrink),
       low_latency_mode(low_latency_mode),
       explicitly_destroy(explicitly_destroy),
-      comm_stream(at::cuda::getStreamFromPool(true)),
-      shared_memory_allocator(use_fabric) {
+      comm_stream(at::cuda::getStreamFromPool(true))
+#ifndef USE_ROCM
+      , shared_memory_allocator(use_fabric)
+#endif
+{
     // Metadata memory
 #ifdef USE_ROCM
     int64_t barrier_signal_bytes = NUM_MAX_FIFO_SLOTS * sizeof(int);
@@ -347,7 +350,7 @@ void Buffer::destroy() {
         // Barrier
 #ifdef USE_ROCM
         // TODO remove head from function signature.
-        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream, head);        
+        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);        
         move_fifo_slots();
 #else
         intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
@@ -670,7 +673,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         // TOOD: remove head from signature to match upstream.
 #ifdef USE_ROCM
         intranode::cached_notify_dispatch(
-            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream, head);
+            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
         move_fifo_slots(2);
 #else
         intranode::cached_notify_dispatch(
@@ -705,8 +708,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                    barrier_signal_ptrs_gpu,
                                    rank,
                                    comm_stream,
-                                   num_channels,
-                                   head);
+                                   num_channels);
+                                   
         move_fifo_slots(3);
 
         if (num_worst_tokens > 0) {
@@ -931,8 +934,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                      barrier_signal_ptrs_gpu,
                                      rank,
                                      num_ranks,
-                                     comm_stream,
-                                     head);
+                                     comm_stream);
     // NOTES: this function uses two FIFO slots (barrier before and after)
     #ifdef USE_ROCM    
         move_fifo_slots(2);                
@@ -1227,7 +1229,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    num_experts,
                                    is_token_in_rank.data_ptr<bool>(),
                                    num_tokens,
-                                   num_worst_tokens,
+//                                   num_worst_tokens,
                                    num_channels,
                                    hidden_int4,
                                    num_scales,

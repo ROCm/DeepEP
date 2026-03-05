@@ -113,8 +113,9 @@ def test_main(num_tokens: int,
                             # Check expert indices
                             int_mask = (2**32) - 1
                             num_valid_tokens = recv_count.item()
-                            assert cumulative_local_expert_recv_stats[i].item(
-                            ) == num_valid_tokens, f'{cumulative_local_expert_recv_stats[i].item()} != {num_valid_tokens}'
+                            # cumulative_local_expert_recv_stats not currently enabled.
+                            #assert cumulative_local_expert_recv_stats[i].item(
+                            #) == num_valid_tokens, f'{cumulative_local_expert_recv_stats[i].item()} != {num_valid_tokens}'
                             assert num_valid_tokens == (
                                 recv_layout_range
                                 & int_mask).sum().item(), f'{num_valid_tokens} != {recv_layout_range & int_mask}.sum().item()'

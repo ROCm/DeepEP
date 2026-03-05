@@ -2,12 +2,14 @@
 
 #include <vector>
 
+#include "configs.cuh"
+
 namespace deep_ep {
 
 // Intranode runtime
 namespace intranode {
 
-void barrier(int **barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream);
+void barrier(int **task_fifo_ptrs, int rank, int num_ranks, cudaStream_t stream);
 
 } // namespace intranode
 
@@ -34,7 +36,7 @@ void finalize();
 // Layout kernels
 namespace layout {
 
-void get_dispatch_layout(const topk_idx_t* topk_idx,
+void get_dispatch_layout(const int64_t* topk_idx,
                          int* num_tokens_per_rank,
                          int* num_tokens_per_rdma_rank,
                          int* num_tokens_per_expert,
@@ -201,6 +203,7 @@ void dispatch(void* recv_x,
               const int* recv_gbl_rank_prefix_sum,
               const bool* is_token_in_rank,
               int num_tokens,
+              int num_worst_tokens,
               int hidden_int4,
               int num_scales,
               int num_topk,

@@ -147,10 +147,9 @@ struct LowLatencyBuffer {
 
     void* combine_rdma_send_buffer_data_start = nullptr;
     size_t num_bytes_per_combine_msg = 0;
-#ifdef USE_ROCM
+
     size_t nvl_recv_data_buffer_offset = 0;
     size_t nvl_recv_count_buffer_offset = 0;
-#endif
 
 #ifdef USE_ROCM
     std::pair<int64_t*, int> clean_meta() {
