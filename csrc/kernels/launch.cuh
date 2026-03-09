@@ -25,12 +25,12 @@ typedef struct {
 
 // Compile time void** kernelArgs array fill with variadic arguments
 template <typename T> void fill_kernel_args(void **f, size_t idx, T &&arg) {
-  f[idx] = static_cast<void *>(std::addressof(arg));
+  f[idx] = const_cast<void *>(static_cast<const void *>(std::addressof(arg)));
 }
 
 template <typename Head, typename... Tail>
 void fill_kernel_args(void **f, size_t idx, Head &&head, Tail &&...tail) {
-  f[idx] = static_cast<void *>(std::addressof(head));
+  f[idx] = const_cast<void *>(static_cast<const void *>(std::addressof(head)));
   fill_kernel_args(f, idx + 1, std::forward<Tail>(tail)...);
 }
 } // namespace rocm::experimental
@@ -106,8 +106,13 @@ inline void LAUNCH_KERNEL_NON_COOPERATIVE(T &&config, Kern &&kernel,
 #endif // #if defined(USE_ROCM)
 #endif // #ifndef LAUNCH_KERNEL
 
-#if !defined(USE_ROCM)
 #ifndef SET_SHARED_MEMORY_FOR_TMA
+#if defined(USE_ROCM)
+// ROCm: TMA is not available, just set shared memory size
+#define SET_SHARED_MEMORY_FOR_TMA(kernel)                                                                                                   \
+    EP_HOST_ASSERT(hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size) == hipSuccess);   \
+    cfg.shared_mem_bytes = smem_size;
+#else // CUDA
 #ifndef DISABLE_SM90_FEATURES
 #define SET_SHARED_MEMORY_FOR_TMA(kernel)                                                                                \
     EP_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess); \
@@ -115,8 +120,8 @@ inline void LAUNCH_KERNEL_NON_COOPERATIVE(T &&config, Kern &&kernel,
 #else
 #define SET_SHARED_MEMORY_FOR_TMA(kernel) void()
 #endif
-#endif
-#endif
+#endif // USE_ROCM
+#endif // SET_SHARED_MEMORY_FOR_TMA
 
 
 
