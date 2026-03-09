@@ -215,14 +215,13 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
+
 #ifdef USE_ROCM
 template <int kNumRanks, int kNumThreads>
 #else
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 #endif
 
-
-//__global__ void __launch_bounds__(kNumThreads, 1)
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            float* recv_x_scales,
                                                            int* recv_src_idx,
@@ -590,7 +589,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
     }
 }
 
-
 void dispatch(void* recv_x,
               float* recv_x_scales,
               int* recv_src_idx,
@@ -656,6 +654,7 @@ break
 #undef DISPATCH_LAUNCH_CASE
 }
 
+
 template <int kNumRanks>
 __global__ void cached_notify_combine(
     void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int, int** barrier_signal_ptrs, int rank) {
@@ -677,7 +676,7 @@ __global__ void cached_notify_combine(
         const auto channel_id = sm_id - 1;
         const auto thread_id = static_cast<int>(threadIdx.x);
         const auto rank_id = thread_id / kWarpSize;
-        const auto lane_id = thread_id / kWarpSize;
+        const auto lane_id = thread_id % kWarpSize;
         if (rank_id >= kNumRanks)
             return;
 

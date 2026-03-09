@@ -47,7 +47,7 @@ namespace deep_ep {
 #ifndef TOPK_IDX_BITS
 #define TOPK_IDX_BITS 64
 #endif
-
+#define DISABLE_SM90_FEATURES 1
 #define INT_BITS_T2(bits) int##bits##_t
 #define INT_BITS_T(bits) INT_BITS_T2(bits)
 typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
