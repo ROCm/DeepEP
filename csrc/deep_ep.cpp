@@ -939,20 +939,17 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     #ifdef USE_ROCM    
         move_fifo_slots(2);                
     #endif
-    #ifndef USE_ROCM
-        // Assign bias pointers
-        // At this time, the optional bias is not supported by the underlying kernels. 
-        auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
-        void* bias_ptrs[2] = {nullptr, nullptr};
-        for (int i = 0; i < 2; ++i)
-            if (bias_opts[i].has_value()) {
-                auto bias = bias_opts[i].value();
-                EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
-                EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
-                EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
-                bias_ptrs[i] = bias.data_ptr();
-            }
-    #endif
+    // Assign bias pointers (optional; nullptr is supported)
+    auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
+    void* bias_ptrs[2] = {nullptr, nullptr};
+    for (int i = 0; i < 2; ++i)
+        if (bias_opts[i].has_value()) {
+            auto bias = bias_opts[i].value();
+            EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
+            EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
+            EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
+            bias_ptrs[i] = bias.data_ptr();
+        }
         
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
@@ -967,11 +964,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        recv_topk_weights_ptr,
                        x.data_ptr(),
                        topk_weights_ptr,
-#ifndef USE_ROCM
-                       //TODO: Add biases to ROCM path.
                        bias_ptrs[0],
                        bias_ptrs[1],
-#endif
                        src_idx.data_ptr<int>(),
                        rank_prefix_matrix.data_ptr<int>(),
                        channel_prefix_matrix.data_ptr<int>(),
@@ -997,20 +991,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        //TODO: Remove guard once kernel supports biases.
-        #ifndef USE_ROCM
-            for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
-                to.has_value() ? to->record_stream(comm_stream) : void();
-                if (allocate_on_comm_stream)
-                    to.has_value() ? to->record_stream(compute_stream) : void();
-            }
-        #else
-            for (auto& to : {topk_weights, recv_topk_weights}) {
-                to.has_value() ? to->record_stream(comm_stream) : void();
-                if (allocate_on_comm_stream)
-                    to.has_value() ? to->record_stream(compute_stream) : void();
-            }
-        #endif
+        for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
+            to.has_value() ? to->record_stream(comm_stream) : void();
+            if (allocate_on_comm_stream)
+                to.has_value() ? to->record_stream(compute_stream) : void();
+        }
     } else {
         stream_wait(compute_stream, comm_stream);
     }
