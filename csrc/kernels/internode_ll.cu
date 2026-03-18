@@ -11,6 +11,12 @@
 #if defined(NIC_IO) || defined(NIC_CX7)
   #define ROCM_DISABLE_CTX
 #endif
+#if defined(ROCM_EXPLICIT_CTX)
+#warning "ROCM_EXPLICIT_CTX IS SET"
+#endif
+#if defined(ROCM_DISABLE_CTX)
+#warning "ROCM_DISABLE_CTX IS SET"
+#endif
 
 namespace cg = cooperative_groups;
 using namespace rocshmem;
@@ -723,7 +729,7 @@ combine(void* combined_x,
             
             if (sub_warp_id == 0 && num_ranks == 16) {
 #if defined(ROCM_EXPLICIT_CTX)
-                //internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
+                internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
 #elif !defined(ROCM_DISABLE_CTX)
                 internode::shmem_ctx_quiet(ctx);
 #else
