@@ -11,6 +11,9 @@
 #if defined(NIC_IO) || defined(NIC_CX7)
   #define ROCM_DISABLE_CTX
 #endif
+#if defined(ROCM_EXPLICIT_CTX)
+  #define ROCM_DISABLE_CTX 1
+#endif
 
 namespace cg = cooperative_groups;
 using namespace rocshmem;
@@ -109,7 +112,7 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
     using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
     EP_STATIC_ASSERT(sizeof(packed_t) % sizeof(scale_t) == 0, "Invalid vector length");
-#if !defined(ROCM_DISABLE_CTX)
+#if !defined(ROCM_DISABLE_CTX) && !defined(ROCM_EXPLICIT_CTX)
     __shared__ internode::shmem_ctx_t ctx;
     if constexpr (kMultinode)
         EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0 or ctx == ROCSHMEM_CTX_INVALID);
@@ -244,10 +247,12 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
                     if constexpr (!kMultinode) {
                         internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(src_ptr), num_bytes_per_msg, dst_rank);
                     } else {
-#if defined(ROCM_DISABLE_CTX)
-                        internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(src_ptr), num_bytes_per_msg, dst_rank);
-#else //DISABLE_CTX
+#if defined(ROCM_EXPLICIT_CTX)
+                        internode::shmem_ctx_schar_put_nbi_warp(rocshmem_ctx_array[dst_expert_local_idx], reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(src_ptr), num_bytes_per_msg, dst_rank);
+#elif !defined(ROCM_DISABLE_CTX)
                         internode::shmem_ctx_schar_put_nbi_warp(ctx, reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(src_ptr), num_bytes_per_msg, dst_rank);
+#else
+                        internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(src_ptr), num_bytes_per_msg, dst_rank);
 #endif
                     }
 #else //USE_ROCM
@@ -314,10 +319,12 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
 #if defined(NIC_IO) || defined(NIC_THOR2)
      if constexpr (kMultinode){
          if (thread_id == 0 ){
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmem_fence();
-#else
+#if defined(ROCM_EXPLICIT_CTX)
+                    internode::shmem_ctx_quiet(rocshmem_ctx_array[dst_expert_local_idx]);
+#elif !defined(ROCM_DISABLE_CTX)
                     internode::shmem_ctx_quiet(ctx);
+#else
+                    internode::shmem_fence();
 #endif
         }
      }
@@ -346,10 +353,12 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
                 if (dst_rank / NUM_MAX_NVL_PEERS == rank / NUM_MAX_NVL_PEERS ){
                     rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
                 }else{
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
-#else
+#if defined(ROCM_EXPLICIT_CTX)
+                    internode::shmem_ctx_long_atomic_add(rocshmem_ctx_array[dst_expert_local_idx], rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+#elif !defined(ROCM_DISABLE_CTX)
                     internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+#else
+                    internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
 #endif
                 }
             }
@@ -362,10 +371,12 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
 #if defined(NIC_IO) || defined(NIC_THOR2)
      if constexpr (kMultinode){
          if (thread_id == 0 ){
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmem_fence();
-#else
+#if defined(ROCM_EXPLICIT_CTX)
+                    internode::shmem_ctx_quiet(rocshmem_ctx_array[dst_expert_local_idx]);
+#elif !defined(ROCM_DISABLE_CTX)
                     internode::shmem_ctx_quiet(ctx);
+#else
+                    internode::shmem_fence();
 #endif
         }
      }
@@ -382,7 +393,7 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
     // Receiving phase
     LOW_LATENCY_DISPATCH_RECV:
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0){
-#if !defined(ROCM_DISABLE_CTX)
+#if !defined(ROCM_DISABLE_CTX) && !defined(ROCM_EXPLICIT_CTX)
         if constexpr (kMultinode)
             internode::shmem_wg_ctx_destroy(&ctx);
 #endif
@@ -484,7 +495,7 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
             }
         }
     }
-#if !defined(ROCM_DISABLE_CTX)
+#if !defined(ROCM_DISABLE_CTX) && !defined(ROCM_EXPLICIT_CTX)
     if constexpr (kMultinode)
         internode::shmem_wg_ctx_destroy(&ctx);
 #endif
@@ -605,7 +616,7 @@ combine(void* combined_x,
         int num_experts, int rank, int num_ranks,
         int phases, bool zero_copy) {
 
-#if !defined(ROCM_DISABLE_CTX)
+#if !defined(ROCM_DISABLE_CTX) && !defined(ROCM_EXPLICIT_CTX)
     __shared__ internode::shmem_ctx_t ctx;
     if constexpr(kMultinode)
         EP_DEVICE_ASSERT(internode::shmem_wg_ctx_create(&ctx) == 0 or ctx == ROCSHMEM_CTX_INVALID);
@@ -688,16 +699,21 @@ combine(void* combined_x,
                 if constexpr (!kMultinode){
                     internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
                 }else{
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
-#else
+
+#if defined(ROCM_EXPLICIT_CTX)
+                    internode::shmem_ctx_schar_put_nbi_warp(rocshmem_ctx_array[local_expert_idx],reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
+#elif !defined(ROCM_DISABLE_CTX)
                     internode::shmem_ctx_schar_put_nbi_warp(ctx,reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
+#else
+                    internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
 #endif
                     if (num_ranks>16)
-#if defined(ROCM_DISABLE_CTX)
-                        internode::shmem_fence();
-#else
+#if defined(ROCM_EXPLICIT_CTX)
+                        internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
+#elif !defined(ROCM_DISABLE_CTX)
                         internode::shmem_ctx_quiet(ctx);
+#else
+                        internode::shmem_fence();
 #endif
                 }
 
@@ -707,10 +723,12 @@ combine(void* combined_x,
         if constexpr (kMultinode){
             
             if (sub_warp_id == 0 && num_ranks == 16)
-#if defined(ROCM_DISABLE_CTX)
-                internode::shmem_fence();
-#else
+#if defined(ROCM_EXPLICIT_CTX)
+                internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
+#elif !defined(ROCM_DISABLE_CTX)
                 internode::shmem_ctx_quiet(ctx);
+#else
+                internode::shmem_fence();
 #endif
         }
 
@@ -738,10 +756,12 @@ combine(void* combined_x,
                         rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
                     }else{
 
-#if defined(ROCM_DISABLE_CTX)
-                        internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
-#else
+#if defined(ROCM_EXPLICIT_CTX)
+                        internode::shmem_ctx_long_atomic_add(rocshmem_ctx_array[local_expert_idx], rdma_recv_flag + global_expert_idx, 1, dst_rank);
+#elif !defined(ROCM_DISABLE_CTX)
                         internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_flag + global_expert_idx, 1, dst_rank);
+#else
+                        internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #endif //DISABLE_CTX
                     }
                 }
@@ -758,7 +778,7 @@ combine(void* combined_x,
     // Receiving phase
     LOW_LATENCY_COMBINE_RECV:
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0){
-#if !defined(ROCM_DISABLE_CTX)
+#if !defined(ROCM_DISABLE_CTX) && !defined(ROCM_EXPLICIT_CTX)
         if constexpr (kMultinode)
             internode::shmem_wg_ctx_destroy(&ctx);
 #endif
@@ -816,7 +836,7 @@ combine(void* combined_x,
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
         }
     }
-#if !defined(ROCM_DISABLE_CTX)
+#if !defined(ROCM_DISABLE_CTX) && !defined(ROCM_EXPLICIT_CTX)
     if constexpr (kMultinode)
         internode::shmem_wg_ctx_destroy(&ctx);
 #endif
