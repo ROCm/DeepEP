@@ -11,12 +11,6 @@
 #if defined(NIC_IO) || defined(NIC_CX7)
   #define ROCM_DISABLE_CTX
 #endif
-#if defined(ROCM_EXPLICIT_CTX)
-#warning "ROCM_EXPLICIT_CTX IS SET"
-#endif
-#if defined(ROCM_DISABLE_CTX)
-#warning "ROCM_DISABLE_CTX IS SET"
-#endif
 
 namespace cg = cooperative_groups;
 using namespace rocshmem;
@@ -350,12 +344,12 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
         }
         if (dst_rank != rank) {
 #ifdef USE_ROCM
-           if constexpr (!kMultinode){
+            if constexpr (!kMultinode){
                 rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
             }else{
                 __threadfence_system();
                 if (dst_rank / NUM_MAX_NVL_PEERS == rank / NUM_MAX_NVL_PEERS ){
-                    rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+                    rocshmem::rocshmem_ctx_long_p(rocshmem_ctx_array[dst_expert_local_idx], rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
                 }else{
 #if defined(ROCM_EXPLICIT_CTX)
                     internode::shmem_ctx_long_atomic_add(rocshmem_ctx_array[dst_expert_local_idx], rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
@@ -759,7 +753,7 @@ combine(void* combined_x,
                 } else {
                     __threadfence_system();
                     if (dst_rank / NUM_MAX_NVL_PEERS == rank / NUM_MAX_NVL_PEERS ){
-                        rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
+                        rocshmem::rocshmem_ctx_long_p(rocshmem_ctx_array[local_expert_idx], rdma_recv_flag + global_expert_idx, 1, dst_rank);
                     }else{
 
 #if defined(ROCM_EXPLICIT_CTX)
