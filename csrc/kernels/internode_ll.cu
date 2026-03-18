@@ -705,7 +705,7 @@ combine(void* combined_x,
 #else
                     internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
 #endif
-                    if (num_ranks>16)
+                    if (num_ranks>16) {
 #if defined(ROCM_EXPLICIT_CTX)
                         //internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
 #elif !defined(ROCM_DISABLE_CTX)
@@ -713,6 +713,7 @@ combine(void* combined_x,
 #else
                         internode::shmem_fence();
 #endif
+                    }
                 }
 
             }
@@ -720,14 +721,15 @@ combine(void* combined_x,
 
         if constexpr (kMultinode){
             
-            if (sub_warp_id == 0 && num_ranks == 16)
+            if (sub_warp_id == 0 && num_ranks == 16) {
 #if defined(ROCM_EXPLICIT_CTX)
-                internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
+                //internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
 #elif !defined(ROCM_DISABLE_CTX)
                 internode::shmem_ctx_quiet(ctx);
 #else
                 internode::shmem_fence();
 #endif
+            }
         }
 
         // Put finishing flag
