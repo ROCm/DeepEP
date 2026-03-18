@@ -1234,7 +1234,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                    num_nvl_bytes,
                                    low_latency_mode);
-        move_fifo_slots(3);
+        //move_fifo_slots(3);
 
         // Synchronize total received tokens and tokens per expert
         if (num_worst_tokens > 0) {

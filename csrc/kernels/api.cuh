@@ -184,7 +184,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
                      bool low_latency_mode,
-                     int head = 0);
+                    int head = 0);
 
 void dispatch(void* recv_x,
               float* recv_x_scales,
