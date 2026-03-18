@@ -11,9 +11,6 @@
 #if defined(NIC_IO) || defined(NIC_CX7)
   #define ROCM_DISABLE_CTX
 #endif
-#if defined(ROCM_EXPLICIT_CTX)
-  #define ROCM_DISABLE_CTX 1
-#endif
 
 namespace cg = cooperative_groups;
 using namespace rocshmem;
