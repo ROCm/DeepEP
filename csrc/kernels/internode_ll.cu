@@ -317,7 +317,8 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
      if constexpr (kMultinode){
          if (thread_id == 0 ){
 #if defined(ROCM_EXPLICIT_CTX)
-                    internode::shmem_ctx_quiet(rocshmem_ctx_array[dst_expert_local_idx]);
+             //there is more than one ctx used in the loop above, disabling this as should not be required
+//                    internode::shmem_ctx_quiet(rocshmem_ctx_array[dst_expert_local_idx]);
 #elif !defined(ROCM_DISABLE_CTX)
                     internode::shmem_ctx_quiet(ctx);
 #else
@@ -369,7 +370,7 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
      if constexpr (kMultinode){
          if (thread_id == 0 ){
 #if defined(ROCM_EXPLICIT_CTX)
-                    internode::shmem_ctx_quiet(rocshmem_ctx_array[dst_expert_local_idx]);
+                    //internode::shmem_ctx_quiet(rocshmem_ctx_array[dst_expert_local_idx]);
 #elif !defined(ROCM_DISABLE_CTX)
                     internode::shmem_ctx_quiet(ctx);
 #else
@@ -706,7 +707,7 @@ combine(void* combined_x,
 #endif
                     if (num_ranks>16)
 #if defined(ROCM_EXPLICIT_CTX)
-                        internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
+                        //internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
 #elif !defined(ROCM_DISABLE_CTX)
                         internode::shmem_ctx_quiet(ctx);
 #else
