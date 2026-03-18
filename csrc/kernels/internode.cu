@@ -1,6 +1,12 @@
-#include "configs.cuh"
+#include <functional>
+#include <optional>
+
 #include "buffer.cuh"
+#include "configs.cuh"
 #include "exception.cuh"
+#ifndef USE_ROCM
+#include "ibgda_device.cuh"
+#endif
 #include "launch.cuh"
 #include "utils.cuh"
 #include "shmem_wrapper.cuh"
@@ -9,7 +15,11 @@ namespace deep_ep {
 
 namespace internode {
 
+#ifdef USE_ROCM
 extern shmem_team_t cpu_rdma_team;
+#else
+extern nvshmem_team_t cpu_rdma_team;
+#endif
 
 #ifdef USE_ROCM
 struct WorkgroupWarpBarrier {
@@ -76,6 +86,7 @@ int get_source_meta_bytes() {
     return sizeof(SourceMeta);
 }
 
+#ifdef USE_ROCM
 __host__ __device__ __forceinline__
 int64_t get_num_bytes_per_rdma_token(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
     return static_cast<int>(align(hidden_int4 * sizeof(int4) + sizeof(SourceMeta) + num_scales * sizeof(float) + num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float), sizeof(int4)));
@@ -101,15 +112,69 @@ std::pair<int, int> get_nvl_clean_meta(int hidden_int4, int num_scales, int num_
 }
 
 template <bool kLowLatencyMode>
-__forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, const int nvl_rank) {
-    return kLowLatencyMode ? (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank) : dst_rdma_rank;
-}
-
-template <bool kLowLatencyMode>
 __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const shmem_team_t& rdma_team) {
     // NOTE: shmem_device_barrier_all() might be an issue as
     // it doesn't follow OpenSHMEM specification on ROCm
     kLowLatencyMode ? void(shmem_barrier(rdma_team)) : shmem_device_barrier_all();
+}
+#else
+__host__ __device__ __forceinline__ int get_num_bytes_per_token(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
+    return static_cast<int>(align_up(hidden_int4 * sizeof(int4) + sizeof(SourceMeta) + num_scales * sizeof(float) +
+                                         num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float),
+                                     sizeof(int4)));
+}
+
+__host__ __device__ __forceinline__
+int64_t get_num_bytes_per_rdma_token(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
+    return static_cast<int>(align(hidden_int4 * sizeof(int4) + sizeof(SourceMeta) + num_scales * sizeof(float) + num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float), sizeof(int4)));
+}
+
+__host__ __device__ __forceinline__ std::pair<int, int> get_rdma_clean_meta(int hidden_int4,
+                                                                              int num_scales,
+                                                                              int num_topk_idx,
+                                                                              int num_topk_weights,
+                                                                              int num_rdma_ranks,
+                                                                              int num_rdma_recv_buffer_tokens,
+                                                                              int num_channels) {
+    // Return `int32_t` offset and count to clean
+    return {(get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_rdma_recv_buffer_tokens *
+             num_rdma_ranks * 2 * num_channels) /
+                sizeof(int),
+            (NUM_MAX_NVL_PEERS * 2 + 4) * num_rdma_ranks * 2 * num_channels};
+}
+
+__host__ __device__ __forceinline__ std::pair<int, int> get_nvl_clean_meta(int hidden_int4,
+                                                                           int num_scales,
+                                                                           int num_topk_idx,
+                                                                           int num_topk_weights,
+                                                                           int num_rdma_ranks,
+                                                                           int num_nvl_ranks,
+                                                                           int num_nvl_recv_buffer_tokens,
+                                                                           int num_channels,
+                                                                           bool is_dispatch) {
+    (void)is_dispatch;
+    // Return `int32_t` offset and to clean
+    EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
+
+    return {
+        (num_nvl_recv_buffer_tokens * get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_nvl_ranks *
+         num_channels) /
+            sizeof(int),
+        num_nvl_ranks * (2 * num_rdma_ranks + 2) * num_channels,
+    };
+}
+
+using rdma_team_t = nvshmem_team_t;
+template <bool kLowLatencyMode>
+__forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const rdma_team_t& rdma_team) {
+    kLowLatencyMode ? void(nvshmem_sync(rdma_team)) : nvshmem_sync_all();
+}
+
+#endif
+
+template <bool kLowLatencyMode>
+__forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, const int nvl_rank) {
+    return kLowLatencyMode ? (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank) : dst_rdma_rank;
 }
 
 template <bool kLowLatencyMode, int kNumRDMARanks>
