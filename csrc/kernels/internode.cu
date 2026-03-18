@@ -178,18 +178,35 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
 }
 
 template <bool kLowLatencyMode, int kNumRDMARanks>
-__global__ void
-notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
-                const int* num_tokens_per_rdma_rank, int* moe_recv_rdma_counter_mapped,
-                const int* num_tokens_per_expert, int* moe_recv_expert_counter_mapped, int num_experts,
-                const bool* is_token_in_rank, int num_tokens, int num_channels, int expert_alignment,
-                const int rdma_clean_offset, const int rdma_num_int_clean,
-                const int nvl_clean_offset, const int nvl_num_int_clean,
-                int* rdma_channel_prefix_matrix, int* recv_rdma_rank_prefix_sum,
-                int* gbl_channel_prefix_matrix, int* recv_gbl_rank_prefix_sum,
-                void* rdma_buffer_ptr,
-                void** buffer_ptrs, int** barrier_signal_ptrs, int head, int rank,
-                const shmem_team_t rdma_team) {
+__global__ void notify_dispatch(const int* num_tokens_per_rank,
+                                int* moe_recv_counter_mapped,
+                                int num_ranks,
+                                const int* num_tokens_per_rdma_rank,
+                                int* moe_recv_rdma_counter_mapped,
+                                const int* num_tokens_per_expert,
+                                int* moe_recv_expert_counter_mapped,
+                                int num_experts,
+                                const bool* is_token_in_rank,
+                                int num_tokens,
+                                int num_worst_tokens,
+                                int num_channels,
+                                int expert_alignment,
+                                const int rdma_clean_offset,
+                                const int rdma_num_int_clean,
+                                const int nvl_clean_offset,
+                                const int nvl_num_int_clean,
+                                int* rdma_channel_prefix_matrix,
+                                int* recv_rdma_rank_prefix_sum,
+                                int* gbl_channel_prefix_matrix,
+                                int* recv_gbl_rank_prefix_sum,
+                                void* rdma_buffer_ptr,
+                                void** buffer_ptrs,
+                                int** barrier_signal_ptrs,
+                                int rank,
+                                const shmem_team_t rdma_team){
+#ifdef USE_ROCM
+    (void)num_worst_tokens;
+#endif
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / kWarpSize, lane_id = get_lane_id();
     auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / kWarpSize;
@@ -202,6 +219,15 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // Global barrier: the first warp do intra-node sync, the second warp do internode sync
         EP_DEVICE_ASSERT(num_warps > 1);
         EP_DEVICE_ASSERT(kNumRDMARanks <= num_threads);
+#ifndef USE_ROCM
+        auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
+        for (int i = thread_id; i < qps_per_rdma_rank * (kNumRDMARanks - 1); i += num_threads) {
+            auto dst_rdma_rank = (i / qps_per_rdma_rank + rdma_rank + 1) % kNumRDMARanks;
+            auto qp_id = i % qps_per_rdma_rank;
+            nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id);
+        }
+        __syncthreads();
+#endif
         if (thread_id == kWarpSize)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
 
@@ -209,7 +235,11 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         __syncthreads();
 
         // Send numbers of tokens per rank/expert to RDMA ranks
+#ifdef USE_ROCM
         auto rdma_buffer_ptr_int = reinterpret_cast<int*>(rdma_buffer_ptr);
+#else
+        auto rdma_buffer_ptr_int = static_cast<int*>(rdma_buffer_ptr);
+#endif
         auto rdma_recv_num_tokens_mixed = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS + num_rdma_experts + 1, kNumRDMARanks);
 
         // Clean up for later data dispatch
@@ -230,8 +260,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         __syncthreads();
 
         // Issue send
-        // TODO: more light fence or barrier or signaling
-        // TODO: overlap EP barrier and NVL cleaning
+#ifdef USE_ROCM
         if (thread_id < kNumRDMARanks) {
             shmem_int_put_nbi(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank), rdma_recv_num_tokens_mixed.send_buffer(thread_id),
                               NUM_MAX_NVL_PEERS + num_rdma_experts + 1,
@@ -240,7 +269,33 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         __syncthreads();
         if (thread_id == 0)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
-
+#else
+        for (int i = warp_id; i < kNumRDMARanks; i += num_warps) {
+            if (i != rdma_rank) {
+                nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank)),
+                                                  reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.send_buffer(i)),
+                                                  (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int),
+                                                  translate_dst_rdma_rank<kLowLatencyMode>(i, nvl_rank),
+                                                  0,
+                                                  lane_id,
+                                                  0);
+            } else {
+                UNROLLED_WARP_COPY(1,
+                                   lane_id,
+                                   NUM_MAX_NVL_PEERS + num_rdma_experts + 1,
+                                   rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank),
+                                   rdma_recv_num_tokens_mixed.send_buffer(i),
+                                   ld_volatile_global,
+                                   st_na_global);
+            }
+        }
+        __syncthreads();
+        if (thread_id < kNumRDMARanks && thread_id != rdma_rank)
+            nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), 0);
+        __syncthreads();
+        if (thread_id == 0)
+            nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+#endif
         __syncthreads();
 
         // NVL buffers
@@ -253,7 +308,11 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         auto nvl_recv_num_tokens_per_expert = AsymBuffer<int>(nvl_recv_buffer, num_nvl_experts, NUM_MAX_NVL_PEERS);
 
         // Clean up for later data dispatch
+#ifdef USE_ROCM
         auto nvl_buffer_ptr_int = reinterpret_cast<int*>(buffer_ptrs[nvl_rank]);
+#else
+        auto nvl_buffer_ptr_int = static_cast<int*>(buffer_ptrs[nvl_rank]);
+#endif
         EP_DEVICE_ASSERT(nvl_reduced_num_tokens_per_expert.total_bytes + nvl_send_num_tokens_per_rank.total_bytes +
                          nvl_send_num_tokens_per_expert.total_bytes <= nvl_clean_offset * sizeof(int));
         #pragma unroll
@@ -280,8 +339,16 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 sum += rdma_recv_num_tokens_mixed.recv_buffer(i)[NUM_MAX_NVL_PEERS + num_rdma_experts];
                 recv_rdma_rank_prefix_sum[i] = sum;
             }
+#ifdef USE_ROCM
             while (ld_volatile_global(moe_recv_rdma_counter_mapped) != -1);
             *moe_recv_rdma_counter_mapped = sum;
+#else
+            if (num_worst_tokens == 0) {
+                while (ld_volatile_global(moe_recv_rdma_counter_mapped) != -1)
+                    ;
+                *moe_recv_rdma_counter_mapped = sum;
+            }
+#endif
         }
 
         // Send numbers of tokens per rank/expert to NVL ranks
@@ -294,11 +361,14 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             for (int i = 0; i < num_nvl_experts; ++ i)
                 nvl_send_num_tokens_per_expert.buffer(nvl_rank)[i] = nvl_reduced_num_tokens_per_expert[thread_id * num_nvl_experts + i];
         }
+#ifdef USE_ROCM
         memory_fence();
         __syncthreads();
         barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
-
         __syncthreads();
+#else
+        barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
+#endif
 
         // Reduce number of tokens per rank/expert
         EP_DEVICE_ASSERT(num_nvl_experts <= num_threads);
@@ -310,8 +380,16 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 sum += nvl_recv_num_tokens_per_rank.buffer(src_nvl_rank)[src_rdma_rank];
                 recv_gbl_rank_prefix_sum[i] = sum;
             }
+#ifdef USE_ROCM
             while (ld_volatile_global(moe_recv_counter_mapped) != -1);
             *moe_recv_counter_mapped = sum;
+#else
+            if (num_worst_tokens == 0) {
+                while (ld_volatile_global(moe_recv_counter_mapped) != -1)
+                    ;
+                *moe_recv_counter_mapped = sum;
+            }
+#endif
         }
         if (thread_id < num_nvl_experts) {
             int sum = 0;
@@ -319,15 +397,27 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
             for (int i = 0; i < NUM_MAX_NVL_PEERS; ++ i)
                 sum += nvl_recv_num_tokens_per_expert.buffer(i)[thread_id];
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
+#ifdef USE_ROCM
             while (ld_volatile_global(moe_recv_expert_counter_mapped + thread_id) != -1);
             moe_recv_expert_counter_mapped[thread_id] = sum;
+#else
+            if (num_worst_tokens == 0) {
+                while (ld_volatile_global(moe_recv_expert_counter_mapped + thread_id) != -1)
+                    ;
+                moe_recv_expert_counter_mapped[thread_id] = sum;
+            }
+#endif
         }
 
         // Finally barrier
         __syncthreads();
         if (thread_id == kWarpSize)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+#ifdef USE_ROCM
         barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
+#else
+        barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
+#endif
 
     } else {
         // Calculate meta data
@@ -355,7 +445,11 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 per_nvl_rank_count[i] = warp_reduce_sum(per_nvl_rank_count[i]);
 
             // Write into channel matrix
+#ifdef USE_ROCM
             if (lane_id == 0) {
+#else
+            if (elect_one_sync()) {
+#endif
                 #pragma unroll
                 for (int i = 0; i < NUM_MAX_NVL_PEERS; ++ i)
                     gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + i) * num_channels + channel_id] = per_nvl_rank_count[i];
@@ -392,6 +486,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int num_experts,
                      const bool* is_token_in_rank,
                      int num_tokens,
+                     int num_worst_tokens,
                      int num_channels,
                      int hidden_int4,
                      int num_scales,
@@ -410,8 +505,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      cudaStream_t stream,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
-                     bool low_latency_mode,
-                     int head = 0) {
+                     bool low_latency_mode) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(num_rdma_ranks) { \
     auto notify_dispatch_func = low_latency_mode ? \
         notify_dispatch<true, num_rdma_ranks> : notify_dispatch<false, num_rdma_ranks>; \
@@ -419,13 +513,13 @@ void notify_dispatch(const int* num_tokens_per_rank,
                   num_tokens_per_rank, moe_recv_counter_mapped, num_ranks, \
                   num_tokens_per_rdma_rank, moe_recv_rdma_counter_mapped, \
                   num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts, \
-                  is_token_in_rank, num_tokens, num_channels, expert_alignment, \
+                  is_token_in_rank, num_tokens, num_worst_tokens, num_channels, expert_alignment, \
                   rdma_clean_meta.first, rdma_clean_meta.second, \
                   nvl_clean_meta.first, nvl_clean_meta.second, \
                   rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
                   gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
                   rdma_buffer_ptr, \
-                  buffer_ptrs, barrier_signal_ptrs, head, rank, \
+                  buffer_ptrs, barrier_signal_ptrs, rank, \
                   cpu_rdma_team); } break
 
     constexpr int kNumThreads = 256;

@@ -165,6 +165,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int num_experts,
                      const bool* is_token_in_rank,
                      int num_tokens,
+                     int num_worst_tokens,
                      int num_channels,
                      int hidden_int4,
                      int num_scales,
@@ -183,8 +184,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      cudaStream_t stream,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
-                     bool low_latency_mode,
-                    int head = 0);
+                     bool low_latency_mode);
 
 void dispatch(void* recv_x,
               float* recv_x_scales,
