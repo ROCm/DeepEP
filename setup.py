@@ -206,6 +206,8 @@ if __name__ == "__main__":
                 "-libverbs",
             ]
         )
+        arch_env = os.environ["PYTORCH_ROCM_ARCH"]
+        extra_link_args.extend([f"--offload-arch={arch}" for arch in arch_env.split(";")])
         if enable_mpi:
             extra_link_args.extend(
                 [
