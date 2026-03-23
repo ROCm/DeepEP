@@ -850,6 +850,48 @@ __forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, f
     }
 }
 
+__forceinline__ __device__ int atomic_cas_cta_acquire(int* addr, int x, int y) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  // TODO: __hip_atomic_compare_exchange_strong or
+  // __hip_atomic_compare_exchange_weak
+  __hip_atomic_compare_exchange_strong(addr, &x, y, __ATOMIC_ACQUIRE,
+                                       __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_WORKGROUP);
+  return x;
+#else
+  int ret;
+  asm volatile("atom.acquire.cta.shared::cta.cas.b32 %0, [%1], %2, %3;"
+               : "=r"(ret)
+               : "l"(addr), "r"(x), "r"(y)
+               : "memory");
+  return ret;
+#endif
+}
+
+__forceinline__ __device__ int atomic_exch_cta_release(int* addr, int x) {
+  int ret;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  ret = __hip_atomic_exchange(addr, x, __ATOMIC_RELEASE,
+                              __HIP_MEMORY_SCOPE_WORKGROUP);
+#else
+  asm volatile("atom.release.cta.shared::cta.exch.b32 %0, [%1], %2;"
+               : "=r"(ret)
+               : "l"(addr), "r"(x)
+               : "memory");
+#endif
+  return ret;
+}
+__forceinline__ __device__ void acquire_lock(int* mutex) {
+  // To make later memory operations valid, we must use `acquire` for memory
+  // semantics
+  while (atomic_cas_cta_acquire(mutex, 0, 1) != 0)
+    ;
+}
+__forceinline__ __device__ void release_lock(int* mutex) {
+  // To make previous memory operations visible to other threads, we must
+  // use `release` for memory semantics
+  atomic_exch_cta_release(mutex, 0);
+}
 template <int kNumRanks, bool kSyncOnly = false>
 __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {
     auto thread_id = static_cast<int>(threadIdx.x);
