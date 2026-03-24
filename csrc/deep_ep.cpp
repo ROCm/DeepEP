@@ -148,11 +148,7 @@ Buffer::Buffer(int rank,
 #endif
 {
     // Metadata memory
-#ifdef USE_ROCM
-    int64_t barrier_signal_bytes = NUM_MAX_FIFO_SLOTS * sizeof(int);
-#else
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
-#endif 
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
     int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int*);
 
@@ -336,10 +332,6 @@ torch::Stream Buffer::get_comm_stream() const {
     return comm_stream;
 }
 
-void Buffer::move_fifo_slots(int num_slots) {
-    head = (head + num_ranks * num_slots) % NUM_MAX_FIFO_SLOTS;
-}
-
 void Buffer::destroy() {
     EP_HOST_ASSERT(not destroyed);
 
@@ -348,13 +340,7 @@ void Buffer::destroy() {
 
     if (num_nvl_bytes > 0) {
         // Barrier
-#ifdef USE_ROCM
-        // TODO remove head from function signature.
-        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);        
-        move_fifo_slots();
-#else
         intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
-#endif
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Close remote IPC
@@ -670,15 +656,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         channel_prefix_matrix = cached_channel_prefix_matrix.value();
 
         // Copy rank prefix matrix and clean flags
-        // TOOD: remove head from signature to match upstream.
-#ifdef USE_ROCM
         intranode::cached_notify_dispatch(
             rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
-        move_fifo_slots(2);
-#else
-        intranode::cached_notify_dispatch(
-            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
-#endif
     } else {
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -709,8 +688,6 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                    rank,
                                    comm_stream,
                                    num_channels);
-                                   
-        move_fifo_slots(3);
 
         if (num_worst_tokens > 0) {
             // No CPU sync, just allocate the worst case
@@ -925,7 +902,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Launch barrier and reset queue head and tail
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
-    //TODO: Remove head from signature to match upstream
     intranode::cached_notify_combine(buffer_ptrs_gpu,
                                      send_head.data_ptr<int>(),
                                      num_channels,
@@ -935,10 +911,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                      rank,
                                      num_ranks,
                                      comm_stream);
-    // NOTES: this function uses two FIFO slots (barrier before and after)
-    #ifdef USE_ROCM    
-        move_fifo_slots(2);                
-    #endif
     // Assign bias pointers (optional; nullptr is supported)
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
     void* bias_ptrs[2] = {nullptr, nullptr};
@@ -1192,8 +1164,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  num_nvl_bytes,
                                  true,
                                  low_latency_mode);
-        //TODO: Try to remove this code.
-        move_fifo_slots(2);
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -1234,7 +1204,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                    num_nvl_bytes,
                                    low_latency_mode);
-        //move_fifo_slots(3);
 
         // Synchronize total received tokens and tokens per expert
         if (num_worst_tokens > 0) {
@@ -1514,7 +1483,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              num_nvl_bytes,
                              false,
                              low_latency_mode);
-    move_fifo_slots(2);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});

@@ -183,12 +183,6 @@ __global__ void cached_notify_dispatch(
     for (int i = (num_memset_int & ~3) + thread_id; i < num_memset_int; i += num_threads) {
         ptr[kNumRanks * kNumRanks + i] = 0;
     }
-    // TODO: need to double check the following sync
-    //memory_fence();
-    //__syncthreads();
-
-    // Barrier after cleaning
-    //barrier_device<kNumRanks>(task_fifo_ptrs, head, rank);
 #else
     #pragma unroll
     for (int i = thread_id; i < num_memset_int; i += num_threads)

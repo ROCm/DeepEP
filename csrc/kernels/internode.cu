@@ -1871,8 +1871,7 @@ void cached_notify(int hidden_int4,
                    int64_t num_rdma_bytes,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
-                   bool low_latency_mode,
-                   int head = 0) {
+                   bool low_latency_mode) {
 #ifdef USE_ROCM
     const int num_threads = std::max(128, std::min(kWarpSize * num_channels, 1024));
 #else

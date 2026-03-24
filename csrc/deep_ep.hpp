@@ -95,9 +95,6 @@ private:
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
 
-    // Task fifo. Used for ROCM implementation, else ignored.
-    int head = 0;
-
     // Whether explicit `destroy()` is required.
     bool explicitly_destroy;
     // After `destroy()` be called, this flag will be true
@@ -126,9 +123,6 @@ private:
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
 
-private:
-    void move_fifo_slots(int num_slots = 1);
-    
 public:
     Buffer(int rank,
            int num_ranks,
