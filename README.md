@@ -8,7 +8,7 @@ This edition adds preliminary AMD GPU (ROCm) enablement:
 
 Notice: 
 - Implementation details may differ from the DeepSeek-V3 paper, and AMD behavior may lag NVIDIA in advanced tuning until subsequent releases.
-- The Pytorch commit [e4adf5d](https://github.com/pytorch/pytorch/commit/e4adf5df39d9c472c7dcbac18efde29241e238f0) fixed a bug of the `-fgpu-rdc` flag in Pytorch ROCm submodule. Please use any Pytorch version later than this commit, e.g., nightly Pytorch. (If one is using a Pytorch version that is older than [e4adf5d](https://github.com/pytorch/pytorch/commit/e4adf5df39d9c472c7dcbac18efde29241e238f0), please apply the patch for Pytorch in [rocSHMEM Installation Guide](third-party/README.md))
+- The Pytorch commit [e4adf5d](https://github.com/pytorch/pytorch/commit/e4adf5df39d9c472c7dcbac18efde29241e238f0) fixed a bug of the `-fgpu-rdc` flag in Pytorch ROCm submodule. Please use any Pytorch version later than this commit, e.g., nightly Pytorch. (If one is using a Pytorch version that is older than [e4adf5d](https://github.com/pytorch/pytorch/commit/e4adf5df39d9c472c7dcbac18efde29241e238f0), please apply the patch for Pytorch in [rocSHMEM Installation Guide](https://github.com/ROCm/rocm-systems/blob/develop/projects/rocshmem/README.md))
 
 ## Quick start
 
@@ -49,7 +49,7 @@ ls /sys/class/infiniband
 # To use DeepEP without MPI, please make sure rocSHMEM was built with this flag -DUSE_EXTERNAL_MPI=OFF
 # Pass the NIC_TYPE, which can be one of: cx7, thor2, io. The default is cx7.
 # Then install DeepEP using this command
-python3 setup.py --variant rocm --nic <NIC_TYPE> build develop --user
+python3 setup.py --variant rocm --nic <NIC_TYPE> --rocm-explicit-ctx build develop --user
 
 # To use DeepEP with MPI, please proceed with these commands
 # Export OMPI dir in the next command (e.g., it's $BUILD_DIR/ompi in third-party/README.md)
