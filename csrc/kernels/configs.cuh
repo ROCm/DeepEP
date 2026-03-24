@@ -2,7 +2,6 @@
 
 #define NUM_MAX_NVL_PEERS 8
 #define NUM_MAX_RDMA_PEERS 20
-
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024
 #define NUM_BUFFER_ALIGNMENT_BYTES 128
@@ -20,6 +19,7 @@
 
 #ifdef USE_ROCM
 #define NUM_WAIT_CYCLES_TIMES_64 16
+#define DISABLE_SM90_FEATURES 1
 #endif
 
 #define LOW_LATENCY_SEND_PHASE 1
@@ -38,30 +38,14 @@
 #endif
 #endif
 
-namespace deep_ep {
-
-#ifndef TOPK_IDX_BITS
-#define TOPK_IDX_BITS 64
-#endif
-#define DISABLE_SM90_FEATURES 1
-#define INT_BITS_T2(bits) int##bits##_t
-#define INT_BITS_T(bits) INT_BITS_T2(bits)
-typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
-#undef INT_BITS_T
-#undef INT_BITS_T2
-
-}  // namespace deep_ep
-
 #ifdef USE_ROCM
 static constexpr int32_t kWarpSize = 64;
-// For ROCm equals to half the wave size or Nvidia warp size
 static constexpr int32_t kEmulatedWarpSize = kWarpSize / 2;
 static constexpr uint64_t kFullWarpMask = 0xffffffffffffffff;
 static constexpr uint64_t kFirstHalfMask = 0x00000000ffffffff;
 static constexpr uint64_t kSecondHalfMask = 0xffffffff00000000;
 #else
 static constexpr int32_t kWarpSize = 32;
-// For Nvidia matches the actual warp size
 static constexpr int32_t kEmulatedWarpSize = kWarpSize;
 static constexpr uint32_t kFullWarpMask = 0xffffffff;
 #endif
@@ -83,7 +67,6 @@ static constexpr uint32_t kFullWarpMask = 0xffffffff;
 #undef __CUDA_NO_BFLOAT162_OPERATORS__
 #endif
 
-// Remove Torch restrictions for HIP
 #ifdef __HIP_NO_HALF_OPERATORS__
 #undef __HIP_NO_HALF_OPERATORS__
 #endif
@@ -135,5 +118,5 @@ typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
 #else
 #include <rocshmem/rocshmem.hpp>
 #include <rocshmem/rocshmem_RMA_X.hpp>
-#endif // !USE_ROCM
-#endif // !DISABLE_NVSHMEM
+#endif
+#endif
