@@ -26,6 +26,7 @@
             }                                                                                                                         \
         }                                                                                                                             \
     }
+#ifdef USE_ROCM
 #define UNROLLED_WARP_COPY_EMULATED(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC) \
 { \
     constexpr int kLoopStride = kEmulatedWarpSize * (UNROLL_FACTOR); \
@@ -43,6 +44,7 @@
     for (int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID); __i < (N); __i += kEmulatedWarpSize) \
         ST_FUNC(__dst + __i, LD_FUNC(__src + __i)); \
 }
+#endif
 // HELPER FUNCTIONS #####################################################################################
 #define DEVICE_INLINE __device__ inline __attribute__((always_inline))
 
