@@ -2,35 +2,23 @@
 ## Hardware Prerequisites
 - AMD MI308X/MI300X GPU
 - Infiniband ConnectX-7 (IB or RoCE both acceptable, ideally would test both variants)
-   - For more detailed requirements, see [rocSHMEM](https://github.com/ROCm/rocSHMEM) github repository
+   - For more detailed requirements, see [rocm-systems/rocshmem](https://github.com/ROCm/rocm-systems) github repository and [rocSHMEM Document](https://rocm.docs.amd.com/projects/rocSHMEM/en/latest/index.html)
 
 
 ## Build and installation
 
 ```bash
-# Obtain develop branch
-git clone git@github.com:ROCm/rocSHMEM.git
+# Clone and checkout
+git clone --no-checkout --filter=blob:none https://github.com/ROCm/rocm-systems.git 
+cd rocm-systems
+git sparse-checkout set --cone projects/rocshmem
+git checkout develop
 
-# Build dependencies Open MPI/UCX (used for RO, and as a bootstrap mechanism otherwise)
-export BUILD_DIR=$PWD
-../rocSHMEM/scripts/install_dependencies.sh
-export PATH=$PWD/ompi/bin:$PATH
-export LD_LIBRARY_PATH=$PWD/ucx/lib:$PWD/ompi/lib:$LD_LIBRARY_PATH
-
-# Build rocSHMEM library, library will be installed in $HOME/rocshmem
-mkdir build.mnic && cd build.mnic
-MPI_ROOT=$BUILD_DIR/ompi ../rocSHMEM/scripts/build_configs/gda_mlx5 --fresh \
-  -DUSE_IPC=ON \
-  -DGDA_BNXT=ON
-
-# To build rocSHMEM with MPI disabled, please add this flag -DUSE_EXTERNAL_MPI=OFF
-MPI_ROOT=$BUILD_DIR/ompi ../rocSHMEM/scripts/build_configs/gda_mlx5 --fresh \
-  -DUSE_IPC=ON \
-  -DGDA_BNXT=ON
-  -DUSE_EXTERNAL_MPI=OFF
-
-# You may pass additional arguments to Cmake,
-#   e.g., -DBUILD_LOCAL_GPU_TARGET_ONLY=ON
+# Build rocSHMEM
+mkdir -p /app/rocshmem-build
+export GFX_COMPILATION_ARCH="gfx942"
+rocm-systems/projects/rocshmem/scripts/build_configs/all_backends -DUSE_EXTERNAL_MPI=OFF -DGPU_TARGETS=$GFX_COMPILATION_ARCH
+# 
 ```
 # pytorch patch 
 

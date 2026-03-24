@@ -14,16 +14,16 @@ Notice:
 
 ### Requirements
 
-- MI308X/MI300X GPU (will support more architectures or devices later)
+- MI308X/MI300X/MI350X GPU (will support more architectures or devices later)
 - Python 3.8 and above
-- ROCm 6.3.4
+- ROCm 6.3.4; 7.2.0 and above
 - PyTorch [e4adf5d](https://github.com/pytorch/pytorch/commit/e4adf5df39d9c472c7dcbac18efde29241e238f0) and above
 - xGMI for intranode communication
 - RDMA network for internode communication
 
 ### Download and install rocSHMEM dependency
 
-DeepEP (AMD version) depends on [rocSHMEM](https://github.com/ROCm/rocSHMEM). Please take a look at [rocSHMEM Installation Guide](third-party/README.md) for instructions.
+DeepEP (AMD version) depends on [rocSHMEM](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocshmem). Please take a look at [rocSHMEM Installation Guide](third-party/README.md) for instructions.
 
 ### Development
 
@@ -92,7 +92,7 @@ DeepEP (AMD version) shares the same Python interface with [deepseek-ai/DeepEP](
 
 - [x] MI350X support
 - [ ] AMD Pensando AI NIC support
-- [ ] Broadcom NIC support
+- [x] Broadcom NIC support
 
 ## License
 
