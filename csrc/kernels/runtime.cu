@@ -68,7 +68,6 @@ int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks
                                                 &cpu_rdma_team_config,
                                                 0,
                                                 &cpu_rdma_team) == 0);
-        //TODO::issue on ROCM: enable it for ROCM
 #ifndef USE_ROCM
         EP_HOST_ASSERT(cpu_rdma_team != SHMEM_TEAM_INVALID);
 #endif
@@ -107,7 +106,7 @@ void finalize() {
     }
     shmem_finalize();
 }
-#endif  // !DISABLE_NVSHMEM
+#endif
 
 }  // namespace internode
 
