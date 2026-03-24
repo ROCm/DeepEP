@@ -1,5 +1,5 @@
-#include "configs.cuh"
 #include "buffer.cuh"
+#include "configs.cuh"
 #include "exception.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
@@ -8,7 +8,7 @@ namespace deep_ep {
 
 namespace intranode {
 
-template<int kNumRanks>
+template <int kNumRanks>
 __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 int* moe_recv_counter_mapped,
                                 const int* num_tokens_per_expert,
@@ -27,10 +27,9 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto lane_id = thread_id % kWarpSize, warp_id = thread_id / kWarpSize, num_warps = num_threads / kWarpSize;
-        
+
     if (sm_id == 0) {
         // Barrier first
-
         barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
 
         int *per_rank_buffer, *per_expert_buffer;
@@ -193,7 +192,7 @@ __global__ void cached_notify_dispatch(
     barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
 }
 
-void cached_notify_dispatch(const int* rank_prefix_matrix, 
+void cached_notify_dispatch(const int* rank_prefix_matrix,
                             int num_memset_int,
                             void** buffer_ptrs,
                             int** barrier_signal_ptrs,
@@ -209,13 +208,11 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-
 #ifdef USE_ROCM
 template <int kNumRanks, int kNumThreads>
 #else
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 #endif
-
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            float* recv_x_scales,
                                                            int* recv_src_idx,
@@ -261,7 +258,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
     // Calculate pointers by the specific layout
     // `rank_prefix_matrix`: kNumRanks * kNumRanks * sizeof(int)
-    auto ptr = reinterpret_cast<void*>(reinterpret_cast<int8_t*>(buffer_ptrs[is_sender ? responsible_rank : rank]) + kNumRanks * kNumRanks * sizeof(int));
+    auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[is_sender ? responsible_rank : rank]) +
+                                       kNumRanks * kNumRanks * sizeof(int));
     int target_rank = is_sender ? rank : responsible_rank;
     auto num_channels_total = num_channels * kNumRanks;
     auto channel_rank_offset = responsible_channel * kNumRanks + target_rank;
@@ -282,12 +280,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
     // Channel data buffers, stored on the receiver side
     // `x_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * hidden_int4 * sizeof(int4)
     // `src_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)
-    // `topk_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(int64_t)
+    // `topk_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(topk_idx_t)
     // `topk_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
     // `x_scales_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_scales * sizeof(float)
     auto channel_x_buffers = Buffer<int4>(ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, channel_rank_offset * num_recv_buffer_tokens * hidden_int4);
     auto channel_src_idx_buffers = Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens, channel_rank_offset * num_recv_buffer_tokens);
-    auto channel_topk_idx_buffers = Buffer<int64_t>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
+    auto channel_topk_idx_buffers = Buffer<topk_idx_t>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
     auto channel_topk_weights_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
     auto channel_x_scales_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales, channel_rank_offset * num_recv_buffer_tokens * num_scales);
 
@@ -438,7 +436,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
         // Calculate offset first
-        auto rank_prefix_matrix = reinterpret_cast<int*>(buffer_ptrs[rank]);
+        auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0;
 
         // Receive channel offset
@@ -572,7 +570,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
     // Clean unused `recv_topk_idx` as -1
     if (num_worst_tokens > 0) {
-        auto rank_prefix_matrix = reinterpret_cast<int*>(buffer_ptrs[rank]);
+        auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
         const auto num_recv_tokens = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + rank];
         const auto clean_start = num_recv_tokens * num_topk + sm_id * kNumThreads;
         const auto clean_end = num_worst_tokens * num_topk;
@@ -648,7 +646,6 @@ break
 #undef DISPATCH_LAUNCH_CASE
 }
 
-
 template <int kNumRanks>
 __global__ void cached_notify_combine(
     void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int, int** barrier_signal_ptrs, int rank) {
@@ -684,8 +681,7 @@ __global__ void cached_notify_combine(
             int token_idx = token_idx_tail - lane_id, expected_head = 0;
             auto current_head = (token_idx >= token_start_idx) ? __ldg(send_head + token_idx * kNumRanks + rank_id) : -1;
             for (int i = 0; i < min(kWarpSize, token_idx_tail - token_start_idx + 1); ++i) {
-                // TODO: it is const int head = in upstream
-                int head = shfl_sync(current_head, i);
+                const int head = shfl_sync(current_head, i);
                 if (head < 0) {
                     if (lane_id == i)
                         expected_head = -last_head - 1;
@@ -743,7 +739,6 @@ void cached_notify_combine(void** buffer_ptrs,
     SWITCH_RANKS(CACHED_NOTIFY_COMBINE);
 #undef CACHED_NOTIFY_COMBINE
 }
-
 
 #ifdef USE_ROCM
 template <typename dtype_t, int kNumRanks, int kNumThreads>
@@ -803,7 +798,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         EP_STATIC_ASSERT(num_send_warps * kWarpSize == kNumThreads, "Invalid warp count");
 
         // Calculate pointers by the specific layout
-        auto ptr = reinterpret_cast<void*>(reinterpret_cast<int8_t*>(buffer_ptrs[send_rank_id]));
+        auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[send_rank_id]));
         auto num_channels_total = num_channels * kNumRanks;
         auto channel_rank_offset = responsible_channel * kNumRanks + rank;
 
@@ -958,7 +953,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 #pragma unroll
                 for (int i = 1; i < num_recv_warps; ++i)
                     if (not warp_retired[i])
-                    min_head = min(min_head, warp_channel_head_idx[i][lane_id]);
+                        min_head = min(min_head, warp_channel_head_idx[i][lane_id]);
                 if (min_head != std::numeric_limits<int>::max() and min_head > last_head)
                     st_relaxed_sys_global(channel_head_idx_ptr, last_head = min_head);
             }
@@ -1041,17 +1036,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 syncwarp();
 #endif
 
-// TODO: Need to optimize the following block in ROCm
-// #ifdef USE_ROCM
-//                 #pragma unroll
-//                 for (int i = lane_id; i < hidden_int4; i += kWarpSize) {
-//                     float values[kDtypePerInt4] = {0};
-
-//                     #pragma unroll
-//                     for (int j = 0; j < num_topk_ranks; ++j) {
-//                         int4 recv_value = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
-//                         const dtype_t* recv_value_dtypes = reinterpret_cast<const dtype_t*>(&recv_value);
-// #else   
                 // Reduce data with pipeline
                 constexpr int kNumStages = 8;
 #ifndef USE_ROCM 
@@ -1085,7 +1069,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                     #pragma unroll
                     for (int j = 0; j < num_topk_ranks; ++j) {
                         auto recv_value_dtypes = reinterpret_cast<const dtype_t*>(&recv_value_int4[j]);
-// #endif
                         #pragma unroll
                         for (int k = 0; k < kDtypePerInt4; ++k)
                             values[k] += static_cast<float>(recv_value_dtypes[k]);
@@ -1097,7 +1080,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                     #pragma unroll
                     for (int j = 0; j < kDtypePerInt4; ++j)
                         out_dtypes[j] = static_cast<dtype_t>(values[j]);
-
 
 #ifndef DISABLE_SM90_FEATURES
                     if (i < hidden_int4_aligned) {
@@ -1122,8 +1104,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                         __syncwarp();
                     } else {
 #endif
-                    recv_int4[token_idx * hidden_int4 + i] = out_int4;
-
+                        recv_int4[token_idx * hidden_int4 + i] = out_int4;
 #ifndef DISABLE_SM90_FEATURES
                     }
 #endif
@@ -1245,6 +1226,6 @@ void combine(cudaDataType_t type,
 #undef COMBINE_LAUNCH_CASE
 }
 
-} // namespace intranode
+}  // namespace intranode
 
-} // namespace deep_ep
+}  // namespace deep_ep
