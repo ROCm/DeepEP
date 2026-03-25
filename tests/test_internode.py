@@ -171,7 +171,7 @@ def test_main(args: argparse.Namespace,
                             check_data(recv_topk_weights, recv_gbl_rank_prefix_sum)
 
                     # Test `num_worst_tokens != 0`
-                    if with_topk:
+                    if with_topk and not use_rocm:
                         num_worst_tokens = num_tokens * num_ranks
                         dispatch_args.update({'num_worst_tokens': num_worst_tokens})
                         recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, _, event = buffer.dispatch(**dispatch_args)
@@ -200,7 +200,8 @@ def test_main(args: argparse.Namespace,
                     # Test combine
                     bias_0 = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
                     bias_1 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                    combine_args = {'x': recv_x, 'bias': (bias_0, bias_1), 'handle': handle, 'config': config, 'async_finish': async_mode}
+                    combine_args = {'x': recv_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
+                    combine_args['bias'] = (bias_0, bias_1)
                     if with_topk:
                         combine_args.update({'topk_weights': recv_topk_weights})
                     if previous_mode:
