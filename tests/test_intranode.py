@@ -25,10 +25,7 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     # Random data
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    if use_rocm:
-        x_e4m3 = per_token_cast_to_fp8(x)
-    else:
-        x_e4m3 = per_token_cast_to_fp8(x) if deep_ep.Buffer.is_sm90_compiled() else None
+    x_e4m3 = per_token_cast_to_fp8(x) if (use_rocm or deep_ep.Buffer.is_sm90_compiled()) else None
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T) if x_e4m3 is not None else None
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
@@ -154,8 +151,8 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
                         assert torch.equal(recv_x, recv_worst_x[:recv_x.size(0)])
                         assert torch.equal(recv_topk_idx, recv_worst_topk_idx[:recv_x.size(0)])
                         assert torch.equal(recv_topk_weights_clone, recv_worst_topk_weights[:recv_x.size(0)])
-                        #TODO check why overflow area is not all -1.
-                        #assert torch.all(recv_worst_topk_idx[recv_x.size(0):] == -1).item()
+                        if not use_rocm:
+                            assert torch.all(recv_worst_topk_idx[recv_x.size(0):] == -1).item()
 
                     # Test cached dispatch (must without top-k staffs)
                     if not with_topk:
