@@ -79,11 +79,15 @@ private:
     int device_id;
 #ifdef USE_ROCM
     int gfx;
-#endif    
+#endif
     int num_device_sms;
     int rank, rdma_rank, nvl_rank;
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
+#ifdef USE_ROCM
     cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
+#else
+    shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
+#endif
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
@@ -107,9 +111,10 @@ private:
     // Workspace
     void* workspace = nullptr;
 
-    // global_atomic_counter
+#ifdef USE_ROCM
     int* dispatch_global_atomic_counter = nullptr;
     int* combine_global_atomic_counter = nullptr;
+#endif
 
     // Host-side MoE info
     volatile int* moe_recv_counter = nullptr;
@@ -131,7 +136,11 @@ public:
            bool low_latency_mode,
            bool explicitly_destroy,
            bool enable_shrink,
+#ifdef USE_ROCM
            bool use_fabric = false);
+#else
+           bool use_fabric);
+#endif
 
     ~Buffer() noexcept(false);
 
