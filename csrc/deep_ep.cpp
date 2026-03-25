@@ -1,16 +1,16 @@
+#include "deep_ep.hpp"
+
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
-#include <atomic>
-#include <chrono>
 #include <cuda_runtime.h>
-#include <memory>
 #include <pybind11/functional.h>
 #include <torch/python.h>
 
-#include "deep_ep.hpp"
+#include <chrono>
+#include <memory>
+
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
-
 
 #ifndef USE_ROCM
 namespace shared_memory {
@@ -178,7 +178,7 @@ Buffer::Buffer(int rank,
     CUDA_CHECK(cudaGetDevice(&device_id));
     rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     num_rdma_ranks = std::max(1, num_ranks / NUM_MAX_NVL_PEERS), num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
-#if defined(DISABLE_NVSHMEM) && !defined(USE_ROCM) 
+#if defined(DISABLE_NVSHMEM) && !defined(USE_ROCM)
     EP_HOST_ASSERT(num_rdma_ranks == 1 and not low_latency_mode and "NVSHMEM is disabled during compilation");
 #endif
 
@@ -188,7 +188,7 @@ Buffer::Buffer(int rank,
 #ifdef USE_ROCM
     sscanf(device_prop.gcnArchName, "gfx%d", &gfx);
     EP_HOST_ASSERT(gfx >= 942);
-#endif    
+#endif
     num_device_sms = device_prop.multiProcessorCount;
 
     // Number of per-channel bytes cannot be large
@@ -201,7 +201,6 @@ Buffer::Buffer(int rank,
     	CUDA_CHECK(hipExtMallocWithFlags(&buffer_ptrs[nvl_rank], num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes, hipDeviceMallocUncached));
         CUDA_CHECK(cudaIpcGetMemHandle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]));
 #else
-        // Local IPC: alloc local memory and set local IPC handles
         shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank],
                                        num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes);
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
@@ -222,9 +221,11 @@ Buffer::Buffer(int rank,
         barrier_signal_ptrs_gpu =
             reinterpret_cast<int**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
 #endif
+
         // No need to synchronize, will do a full device sync during `sync`
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
     }
+
     // Create 32 MiB workspace
 #ifdef USE_ROCM
     CUDA_CHECK(hipExtMallocWithFlags(&workspace, NUM_WORKSPACE_BYTES, hipDeviceMallocUncached));
@@ -263,7 +264,11 @@ Buffer::Buffer(int rank,
     // MoE RDMA-level counter
     if (num_rdma_ranks > 0) {
         CUDA_CHECK(cudaMallocHost(&moe_recv_rdma_counter, sizeof(int), cudaHostAllocMapped));
+#ifdef USE_ROCM
         CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_rdma_counter_mapped), const_cast<int*>(moe_recv_rdma_counter), 0));
+#else
+        CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_rdma_counter_mapped, const_cast<int*>(moe_recv_rdma_counter), 0));
+#endif
         *moe_recv_rdma_counter = -1;
     }
 }
@@ -302,10 +307,10 @@ int Buffer::get_local_device_id() const {
 }
 
 pybind11::bytearray Buffer::get_local_ipc_handle() const {
-//TODO: Can we just use upstream here?
 #ifdef USE_ROCM
     return {ipc_handles[nvl_rank].reserved, CUDA_IPC_HANDLE_SIZE};
 #else
+    const shared_memory::MemHandle& handle = ipc_handles[nvl_rank];
     return {reinterpret_cast<const char*>(&handle), sizeof(handle)};
 #endif
 }
@@ -347,20 +352,19 @@ void Buffer::destroy() {
         if (is_available()) {
             for (int i = 0; i < num_nvl_ranks; ++i)
                 if (i != nvl_rank)
-                    #ifdef USE_ROCM
-                        CUDA_CHECK(cudaIpcCloseMemHandle(buffer_ptrs[i]));
-                    #else
-                        shared_memory_allocator.close_mem_handle(buffer_ptrs[i]);
-                    #endif
+#ifdef USE_ROCM
+                    CUDA_CHECK(cudaIpcCloseMemHandle(buffer_ptrs[i]));
+#else
+                    shared_memory_allocator.close_mem_handle(buffer_ptrs[i]);
+#endif
         }
 
         // Free local buffer and error flag
-        #ifdef USE_ROCM
-            CUDA_CHECK(cudaFree(buffer_ptrs[nvl_rank]));
-        #else
-            // Free local buffer and error flag
-            shared_memory_allocator.free(buffer_ptrs[nvl_rank]);
-        #endif
+#ifdef USE_ROCM
+        CUDA_CHECK(cudaFree(buffer_ptrs[nvl_rank]));
+#else
+        shared_memory_allocator.free(buffer_ptrs[nvl_rank]);
+#endif
     }
 
     // Free NVSHMEM
@@ -400,17 +404,26 @@ void Buffer::sync(const std::vector<int>& device_ids,
         for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
             EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
-#ifdef USE_ROCM            
+#ifdef USE_ROCM
             EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
 #else
             EP_HOST_ASSERT(handle_str.size() == shared_memory::HANDLE_SIZE);
 #endif
             if (offset + i != rank) {
+#ifdef USE_ROCM
                 std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
                 CUDA_CHECK(cudaIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
+#else
+                std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
+                shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
+#endif
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
             } else {
+#ifdef USE_ROCM
                 EP_HOST_ASSERT(std::memcmp(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE) == 0);
+#else
+                EP_HOST_ASSERT(std::memcmp(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE) == 0);
+#endif
             }
         }
 
@@ -553,6 +566,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            bool async,
                            bool allocate_on_comm_stream) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
+
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
     int num_channels = config.num_sms / 2;
@@ -649,7 +663,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     // Barrier or send sizes
     // To clean: channel start/end offset, head and tail
-    int num_memset_int = num_channels * num_ranks * 4;    
+    int num_memset_int = num_channels * num_ranks * 4;
     if (cached_mode) {
         num_recv_tokens = cached_num_recv_tokens;
         rank_prefix_matrix = cached_rank_prefix_matrix.value();
@@ -696,22 +710,21 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             // Must be forward with top-k stuffs
             EP_HOST_ASSERT(topk_idx.has_value());
             EP_HOST_ASSERT(topk_weights.has_value());
-        } else { 
+        } else {
             // Synchronize total received tokens and tokens per expert
             auto start_time = std::chrono::high_resolution_clock::now();
             while (true) {
                 // Read total count
                 num_recv_tokens = static_cast<int>(*moe_recv_counter);
-                
+
                 // Read per-expert count
                 bool ready = (num_recv_tokens >= 0);
                 for (int i = 0; i < num_local_experts and ready; ++i)
-                {
                     ready &= moe_recv_expert_counter[i] >= 0;
-                }
 
                 if (ready)
                     break;
+
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
                     NUM_CPU_TIMEOUT_SECS)
@@ -911,7 +924,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                      rank,
                                      num_ranks,
                                      comm_stream);
-    // Assign bias pointers (optional; nullptr is supported)
+
+    // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
     void* bias_ptrs[2] = {nullptr, nullptr};
     for (int i = 0; i < 2; ++i)
@@ -922,7 +936,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
             bias_ptrs[i] = bias.data_ptr();
         }
-        
+
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 +  // Queue head and tail
@@ -930,7 +944,6 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
                    <= num_nvl_bytes);
-
     intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
                        recv_topk_weights_ptr,
@@ -1014,13 +1027,11 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            std::optional<EventHandle>& previous_event,
                            bool async,
                            bool allocate_on_comm_stream) {
-
 #if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
     // unless we release GIL here.
     pybind11::gil_scoped_release release;
-
 
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1581,19 +1592,9 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
     check_boundary(clean_meta_0.first, clean_meta_0.second * sizeof(int));
     check_boundary(clean_meta_1.first, clean_meta_1.second * sizeof(int));
 
-
-    internode_ll::clean_low_latency_buffer(
-#ifdef USE_ROCM
-                                           reinterpret_cast<int64_t*>(clean_meta_0.first),
-#else
-                                           clean_meta_0.first,
-#endif
+    internode_ll::clean_low_latency_buffer(clean_meta_0.first,
                                            clean_meta_0.second,
-#ifdef USE_ROCM
-                                           reinterpret_cast<int64_t*>(clean_meta_1.first),
-#else
-                                           clean_meta_1.first
-#endif
+                                           clean_meta_1.first,
                                            clean_meta_1.second,
                                            rank,
                                            num_ranks,
@@ -1675,7 +1676,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
 #else
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
                                       x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
-#endif                                
+#endif
     auto packed_recv_src_info =
         torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
@@ -1714,19 +1715,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
             dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
             buffer.dispatch_rdma_recv_data_buffer,
-#ifdef USE_ROCM
-            reinterpret_cast<int64_t*>(buffer.dispatch_rdma_recv_count_buffer),
-#else
             buffer.dispatch_rdma_recv_count_buffer,
-#endif
             buffer.dispatch_rdma_send_buffer,
             x.data_ptr(),
             topk_idx.data_ptr<topk_idx_t>(),
-#ifdef USE_ROCM
-            reinterpret_cast<int64_t*>(next_clean_meta.first),
-#else
             next_clean_meta.first,
-#endif
             next_clean_meta.second,
             num_tokens,
             hidden,
@@ -1787,7 +1780,7 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     bool return_recv_hook,
     const std::optional<torch::Tensor>& out) {
 #if !defined(DISABLE_NVSHMEM) || defined(USE_ROCM)
-        EP_HOST_ASSERT(low_latency_mode);
+    EP_HOST_ASSERT(low_latency_mode);
 
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1849,11 +1842,7 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     auto launcher = [=](int phases) {
         internode_ll::combine(combined_x.data_ptr(),
                               buffer.combine_rdma_recv_data_buffer,
-#ifdef USE_ROCM
-                              reinterpret_cast<int64_t*>(buffer.combine_rdma_recv_flag_buffer),
-#else
                               buffer.combine_rdma_recv_flag_buffer,
-#endif
                               buffer.combine_rdma_send_buffer,
                               x.data_ptr(),
                               topk_idx.data_ptr<topk_idx_t>(),
@@ -1862,11 +1851,7 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
                               layout_range.data_ptr<int64_t>(),
                               mask_buffer_ptr,
                               combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
-#ifdef USE_ROCM
-                              reinterpret_cast<int64_t*>(next_clean_meta.first),
-#else
                               next_clean_meta.first,
-#endif
                               next_clean_meta.second,
                               num_combined_tokens,
                               hidden,
