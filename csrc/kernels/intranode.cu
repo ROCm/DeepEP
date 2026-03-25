@@ -239,7 +239,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            int num_max_send_tokens,
                                                            int num_recv_buffer_tokens) {
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
-    const auto thread_id = static_cast<int>(threadIdx.x);
+    const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;
     EP_DEVICE_ASSERT(num_sms % 2 == 0);
 
@@ -253,7 +253,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
     int num_experts_per_rank = num_experts / kNumRanks;
     EP_DEVICE_ASSERT(num_experts_per_rank > 0 or num_topk == 0);
     EP_DEVICE_ASSERT(num_topk <= kWarpSize);
-    EP_DEVICE_ASSERT((topk_idx == nullptr)  == (topk_weights == nullptr));
+    EP_DEVICE_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
     EP_DEVICE_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
 
     // Calculate pointers by the specific layout
@@ -283,11 +283,16 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
     // `topk_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(topk_idx_t)
     // `topk_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
     // `x_scales_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_scales * sizeof(float)
-    auto channel_x_buffers = Buffer<int4>(ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, channel_rank_offset * num_recv_buffer_tokens * hidden_int4);
-    auto channel_src_idx_buffers = Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens, channel_rank_offset * num_recv_buffer_tokens);
-    auto channel_topk_idx_buffers = Buffer<topk_idx_t>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
-    auto channel_topk_weights_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
-    auto channel_x_scales_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales, channel_rank_offset * num_recv_buffer_tokens * num_scales);
+    auto channel_x_buffers = Buffer<int4>(
+        ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, channel_rank_offset * num_recv_buffer_tokens * hidden_int4);
+    auto channel_src_idx_buffers =
+        Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens, channel_rank_offset * num_recv_buffer_tokens);
+    auto channel_topk_idx_buffers = Buffer<topk_idx_t>(
+        ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
+    auto channel_topk_weights_buffers =
+        Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
+    auto channel_x_scales_buffers = Buffer<float>(
+        ptr, num_channels_total * num_recv_buffer_tokens * num_scales, channel_rank_offset * num_recv_buffer_tokens * num_scales);
 
     // TMA stuffs
 #ifndef DISABLE_SM90_FEATURES
@@ -312,20 +317,27 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         constexpr int num_send_warps = kNumThreads / kWarpSize;
         constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
         const auto send_thread_id = thread_id;
-        const auto send_lane_id = send_thread_id % kWarpSize;
         const auto send_warp_id_in_rank = send_thread_id % num_threads_per_rank / kWarpSize;
         EP_DEVICE_ASSERT(kNumRanks <= kWarpSize);
         EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
 
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
-        if (send_lane_id == 0 and send_warp_id_in_rank == 0) {
+        if (send_warp_id_in_rank == 0 and elect_one_sync()) {
             int value = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
+#ifdef USE_ROCM
             st_release_sys_global(channel_start_offset.buffer(), -value - 1);
+#else
+            st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
+#endif
             value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
+#ifdef USE_ROCM
             st_release_sys_global(channel_end_offset.buffer(), -value - 1);
+#else
+            st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1);
+#endif
         }
-        syncwarp();
+        __syncwarp();
 
         // Get tasks
         int token_start_idx, token_end_idx;
@@ -333,29 +345,40 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
         // Iterate over all tokens and send by chunks
         int cached_channel_tail_idx = 0;
-        for (int64_t token_idx = token_start_idx; token_idx < token_end_idx; ) {
+        for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
+#ifdef USE_ROCM
             auto start_time = wall_clock64();
-            while (send_lane_id == 0) {
-                // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
-                int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
-                if (num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens)
-                    break;
+#else
+            auto start_time = clock64();
+#endif
+            if (elect_one_sync()) {
+                while (true) {
+                    // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
+                    int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
+                    if (num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens)
+                        break;
 
-                // Rare cases to loop again
-                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
-                if (elapsed_time > NUM_TIMEOUT_CYCLES) {
-                    printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
-                    trap();
+                    // Rare cases to loop again
+#ifdef USE_ROCM
+                    long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                    if (elapsed_time > NUM_TIMEOUT_CYCLES) {
+#else
+                    if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+#endif
+                        printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", rank, responsible_channel);
+                        trap();
+                    }
                 }
             }
-            syncwarp();
+            __syncwarp();
 
             int chunk_token_idx = 0;
             while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
-                // NOTES: for the same token, the warp assigned to save `send_head` may be different from the warp assigned to send subsequent data
-                if (send_lane_id == 0 and token_idx % num_send_warps_per_rank == send_warp_id_in_rank)
+                // NOTES: for the same token, the warp assigned to save `send_head` may be different from the warp assigned to send the
+                // following data
+                if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync())
                     send_head[token_idx * kNumRanks + responsible_rank] =
                         is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
 
@@ -372,35 +395,33 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                     auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                     auto shifted_x = x + token_idx * hidden_int4;
 #ifdef USE_ROCM
-                    UNROLLED_WARP_COPY(2, send_lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x,
-                                       __ldg, st_na_global);
+                    UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
 #else
-                    UNROLLED_WARP_COPY(5, send_lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x,
-                                       __ldg, st_na_global);
+                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
 #endif
 
                     // Copy source index
-                    if (send_lane_id == 0)
+                    if (elect_one_sync())
                         channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
 
                     // Copy `topk_idx` and `topk_weights` with transformed index
-                    if (send_lane_id < num_topk) {
+                    if (lane_id < num_topk) {
                         // Top-k index
                         int recv_expert_begin = responsible_rank * num_experts_per_rank,
                             recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
-                        auto idx_value = __ldg(topk_idx + token_idx * num_topk + send_lane_id);
+                        auto idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id);
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
-                        channel_topk_idx_buffers[dst_slot_idx * num_topk + send_lane_id] = idx_value;
+                        channel_topk_idx_buffers[dst_slot_idx * num_topk + lane_id] = idx_value;
 
                         // Top-k weights
-                        auto weight_value = __ldg(topk_weights + token_idx * num_topk + send_lane_id);
+                        auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
                         weight_value = (idx_value >= 0) ? weight_value : 0.0f;
-                        channel_topk_weights_buffers[dst_slot_idx * num_topk + send_lane_id] = weight_value;
+                        channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = weight_value;
                     }
 
                     // Copy `x_scales`
                     #pragma unroll
-                    for (int i = send_lane_id; i < num_scales; i += kWarpSize) {
+                    for (int i = lane_id; i < num_scales; i += kWarpSize) {
                         auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
                         channel_x_scales_buffers[dst_slot_idx * num_scales + i] = __ldg(x_scales + offset);
                     }
@@ -421,7 +442,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 #else
             asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
 #endif
-            if (send_warp_id_in_rank == 0 and send_lane_id == 0)
+            if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
         }
     } else {
@@ -429,7 +450,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         constexpr int num_recv_warps = kNumThreads / kWarpSize;
         constexpr int num_recv_warps_per_rank = num_recv_warps / kNumRanks;
         const auto recv_thread_id = thread_id;
-        const auto recv_lane_id = recv_thread_id % kWarpSize;
         const auto recv_thread_id_in_rank = recv_thread_id % num_threads_per_rank;
         const auto recv_warp_id_in_rank = recv_thread_id_in_rank / kWarpSize;
         EP_DEVICE_ASSERT(kNumRanks <= kWarpSize);
@@ -441,9 +461,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
         // Receive channel offset
         int total_offset, num_tokens_to_recv;
-        while (recv_lane_id == 0 and (total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0);
-        while (recv_lane_id == 0 and (num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0);
-        if (recv_lane_id == 0) {
+        if (elect_one_sync()) {
+            while ((total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
+                ;
+            while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
+                ;
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
             if (recv_warp_id_in_rank == 0)
                 recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset;
@@ -456,7 +478,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         // Shared tail indices for different warps
         __shared__ volatile int shared_channel_tail_idx[kNumRanks];
 
+#ifdef USE_ROCM
         auto start_time = wall_clock64();
+#else
+        auto start_time = clock64();
+#endif
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by different warps are the same
@@ -470,10 +496,16 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 }
 
                 // Timeout check
+#ifdef USE_ROCM
                 long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
                 if (elapsed_time > NUM_TIMEOUT_CYCLES) {
+#else
+                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+#endif
                     printf("DeepEP timeout for dispatch receivers, rank %d, responsible_channel = %d, tokens remained: %d\n",
-                           rank, responsible_channel, num_tokens_to_recv);
+                           rank,
+                           responsible_channel,
+                           num_tokens_to_recv);
                     trap();
                 }
             }
@@ -512,11 +544,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 #endif // USE_ROCM
 #else
 #ifdef USE_ROCM
-                UNROLLED_WARP_COPY(2, recv_lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4,
-                                   ld_nc_global, st_na_global);
+                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_global, st_na_global);
 #else
-                UNROLLED_WARP_COPY(5, recv_lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4,
-                                   ld_nc_global, st_na_global);
+                UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_global, st_na_global);
 #endif
 #endif
             }
@@ -560,8 +590,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 #else
             asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
 #endif
-            if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and recv_lane_id == 0)
+            if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and elect_one_sync())
+#ifdef USE_ROCM
                 st_release_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
+#else
+                st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
+#endif
 
             // Exit
             num_tokens_to_recv -= num_recv_tokens;
@@ -609,6 +643,7 @@ void dispatch(void* recv_x,
               int num_sms,
               int num_max_send_tokens,
               int num_recv_buffer_tokens) {
+#ifdef USE_ROCM
     constexpr int kNumThreads = (kWarpSize == 64 ? 1024 : 768);
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                      \
@@ -639,6 +674,51 @@ LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, dispatch<ranks, kNumThreads>,        \
                       num_max_send_tokens,                               \
                       num_recv_buffer_tokens);                           \
 break
+#else
+    constexpr int kNumThreads = 768;
+    constexpr int kNumTMABytesPerWarp = 8192;
+#ifndef DISABLE_SM90_FEATURES
+    constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
+#endif
+
+    // Make sure never OOB
+    EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
+
+#define DISPATCH_LAUNCH_CASE(ranks)                                      \
+    {                                                                    \
+        auto kernel = dispatch<ranks, kNumThreads, kNumTMABytesPerWarp>; \
+        SET_SHARED_MEMORY_FOR_TMA(kernel);                               \
+        LAUNCH_KERNEL(&cfg,                                              \
+                      kernel,                                            \
+                      reinterpret_cast<int4*>(recv_x),                   \
+                      recv_x_scales,                                     \
+                      recv_src_idx,                                      \
+                      recv_topk_idx,                                     \
+                      recv_topk_weights,                                 \
+                      recv_channel_offset,                               \
+                      send_head,                                         \
+                      reinterpret_cast<const int4*>(x),                  \
+                      x_scales,                                          \
+                      topk_idx,                                          \
+                      topk_weights,                                      \
+                      is_token_in_rank,                                  \
+                      channel_prefix_matrix,                             \
+                      num_tokens,                                        \
+                      num_worst_tokens,                                  \
+                      hidden_int4,                                       \
+                      num_topk,                                          \
+                      num_experts,                                       \
+                      num_scales,                                        \
+                      scale_token_stride,                                \
+                      scale_hidden_stride,                               \
+                      buffer_ptrs,                                       \
+                      rank,                                              \
+                      num_max_send_tokens,                               \
+                      num_recv_buffer_tokens);                           \
+    }                                                                    \
+    break
+#endif
+
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(num_sms % 2 == 0);
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
@@ -694,7 +774,6 @@ __global__ void cached_notify_combine(
         }
     }
 }
-
 
 void cached_notify_combine(void** buffer_ptrs,
                            int* send_head,
@@ -881,33 +960,29 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 // Send `topk_weights`
                 if (num_topk > 0 and lane_id < num_topk)
                     channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] =
-                    __ldg(topk_weights + (token_idx + i) * num_topk + lane_id);
+                        __ldg(topk_weights + (token_idx + i) * num_topk + lane_id);
             }
             token_idx += num_round_tokens;
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
 #ifdef USE_ROCM
-            if (num_threads_per_rank > kWarpSize){
+            if (num_threads_per_rank > kWarpSize) {
                 __syncthreads();
-            }else{
+            } else {
                 syncwarp();
             }
 #else
             asm volatile("bar.sync %0, %1;" ::"r"(send_rank_id), "r"(num_threads_per_rank));
 #endif
             if (send_warp_id_in_rank == 0 and elect_one_sync())
-#ifdef USE_ROCM
-                st_relaxed_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
-#else
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
-#endif
         }
     } else {
         // Workers for receiving
         // One warp for moving the queue head, others for reduction
         constexpr int num_recv_warps = kNumThreads / kWarpSize;
-        int recv_warp_id = thread_id / kWarpSize;
+        const auto recv_warp_id = thread_id / kWarpSize;
         EP_DEVICE_ASSERT(kNumRanks <= kWarpSize and kNumThreads > kWarpSize);
         EP_DEVICE_ASSERT(thread_id >= 0 and kNumThreads % kWarpSize == 0);
 
@@ -922,10 +997,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         if (thread_id < kNumRanks)
             channel_tail_idx[thread_id] = 0;
 #ifdef USE_ROCM
-            __syncthreads();
+        __syncthreads();
 #else
         asm volatile("bar.sync 0, %0;" ::"r"(kNumThreads));
 #endif
+
         if (thread_id < kWarpSize) {
             int* channel_head_idx_ptr = static_cast<int*>(buffer_ptrs[rank]) + responsible_channel * kNumRanks + lane_id;
             int* channel_tail_idx_ptr = channel_head_idx_ptr + num_channels * kNumRanks;
@@ -996,13 +1072,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 if (lane_id < kNumRanks)
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
 
-#ifdef USE_ROCM                
+#ifdef USE_ROCM
                 auto start_time = wall_clock64();
 #else
                 auto start_time = clock64();
 #endif
                 while (__any_sync(kFullWarpMask, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
-                // while (channel_tail_idx[lane_id] <= expected_head and expected_head >= 0) {
                     // Timeout check
 #ifdef USE_ROCM
                     long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
@@ -1011,9 +1086,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                     if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
 #endif
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n",
-                            rank,
-                            responsible_channel,
-                            expected_head);
+                               rank,
+                               responsible_channel,
+                               expected_head);
                         trap();
                     }
                 }
@@ -1038,12 +1113,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
 
                 // Reduce data with pipeline
                 constexpr int kNumStages = 8;
-#ifndef USE_ROCM 
+#ifndef USE_ROCM
                 EP_STATIC_ASSERT(kNumStages * kWarpSize * sizeof(int4) <= kNumTMABytesPerWarp, "Invalid count");
 #endif
 
                 #pragma unroll
-                for (int i = lane_id; i < hidden_int4; i += 32) {
+                for (int i = lane_id; i < hidden_int4; i += kWarpSize) {
                     // Read bias
                     // TODO: make it as a template
                     int4 bias_0_value_int4 =
@@ -1229,3 +1304,4 @@ void combine(cudaDataType_t type,
 }  // namespace intranode
 
 }  // namespace deep_ep
+
