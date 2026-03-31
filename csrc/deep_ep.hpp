@@ -102,7 +102,8 @@ public:
            int64_t num_rdma_bytes,
            bool low_latency_mode,
            bool explicitly_destroy,
-           bool enable_shrink);
+           bool enable_shrink,
+           bool use_fabric = false);
 
     ~Buffer() noexcept(false);
 
@@ -170,6 +171,8 @@ public:
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,
         const std::optional<torch::Tensor>& topk_weights,
+        const std::optional<torch::Tensor>& bias_0,
+        const std::optional<torch::Tensor>& bias_1,
         const torch::Tensor& src_idx,
         const torch::Tensor& rank_prefix_matrix,
         const torch::Tensor& channel_prefix_matrix,
@@ -209,6 +212,7 @@ public:
                        const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix,
                        const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
                        int expert_alignment,
+                       int num_worst_tokens,
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
                        bool async,

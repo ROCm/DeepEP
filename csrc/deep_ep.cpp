@@ -19,7 +19,8 @@ Buffer::Buffer(int rank,
                int64_t num_rdma_bytes,
                bool low_latency_mode,
                bool explicitly_destroy,
-               bool enable_shrink)
+               bool enable_shrink,
+               bool use_fabric)
     : rank(rank),
       num_ranks(num_ranks),
       num_nvl_bytes(num_nvl_bytes),
@@ -686,6 +687,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> Buffer::intranode_combine(
     const torch::Tensor& x,
     const std::optional<torch::Tensor>& topk_weights,
+    const std::optional<torch::Tensor>& bias_0,
+    const std::optional<torch::Tensor>& bias_1,
     const torch::Tensor& src_idx,
     const torch::Tensor& rank_prefix_matrix,
     const torch::Tensor& channel_prefix_matrix,
@@ -760,18 +763,17 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     
 
     // Assign bias pointers
-    // At this time, the optional bias is not supported by the underlying kernels. 
-    /*auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
+    auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
     void* bias_ptrs[2] = {nullptr, nullptr};
     for (int i = 0; i < 2; ++i)
         if (bias_opts[i].has_value()) {
-            auto bias = bias_opts[i].value();
+            auto& bias = bias_opts[i].value();
             EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
             EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
             EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
             bias_ptrs[i] = bias.data_ptr();
         }
-    */
+
     // Combine data
     auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
     EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 +  // Queue head and tail
@@ -779,12 +781,13 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
                    <= num_nvl_bytes);
-
     intranode::combine(at::cuda::ScalarTypeToCudaDataType(x.scalar_type()),
                        recv_x.data_ptr(),
                        recv_topk_weights_ptr,
                        x.data_ptr(),
                        topk_weights_ptr,
+                       bias_ptrs[0],
+                       bias_ptrs[1],
                        src_idx.data_ptr<int>(),
                        rank_prefix_matrix.data_ptr<int>(),
                        channel_prefix_matrix.data_ptr<int>(),
@@ -810,12 +813,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);
         }
-        /*for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
-            to.has_value() ? to->record_stream(comm_stream) : void();
-            if (allocate_on_comm_stream)
-                to.has_value() ? to->record_stream(compute_stream) : void();
-        }*/
-        for (auto& to : {topk_weights, recv_topk_weights}) {
+        for (auto& to : {topk_weights, recv_topk_weights, bias_0, bias_1}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
@@ -861,6 +859,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix,
                            const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
                            int expert_alignment,
+                           int num_worst_tokens,
                            const Config& config,
                            std::optional<EventHandle>& previous_event,
                            bool async,
@@ -1058,28 +1057,36 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    low_latency_mode);
         move_fifo_slots(3);
 
-        // Synchronize total received tokens and tokens per expert
-        auto start_time = std::chrono::high_resolution_clock::now();
-        while (true) {
-            // Read total count
-            num_recv_tokens = static_cast<int>(*moe_recv_counter);
-            num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter);
+        if (num_worst_tokens > 0) {
+            num_recv_tokens = num_worst_tokens;
+            num_rdma_recv_tokens = num_worst_tokens;
 
-            // Read per-expert count
-            bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0);
-            for (int i = 0; i < num_local_experts and ready; ++i)
-                ready &= moe_recv_expert_counter[i] >= 0;
+            EP_HOST_ASSERT(topk_idx.has_value());
+            EP_HOST_ASSERT(topk_weights.has_value());
+        } else {
+            // Synchronize total received tokens and tokens per expert
+            auto start_time = std::chrono::high_resolution_clock::now();
+            while (true) {
+                // Read total count
+                num_recv_tokens = static_cast<int>(*moe_recv_counter);
+                num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter);
 
-            if (ready)
-                break;
+                // Read per-expert count
+                bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0);
+                for (int i = 0; i < num_local_experts and ready; ++i)
+                    ready &= moe_recv_expert_counter[i] >= 0;
 
-            // Timeout check
-            if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
-                NUM_CPU_TIMEOUT_SECS) {
-                throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
+                if (ready)
+                    break;
+
+                // Timeout check
+                if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
+                    NUM_CPU_TIMEOUT_SECS) {
+                    throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
+                }
             }
+            num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }
-        num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
     }
 
     // Allocate new tensors
@@ -1798,7 +1805,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool>())
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)

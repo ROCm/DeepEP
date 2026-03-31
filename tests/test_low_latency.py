@@ -6,7 +6,7 @@ from functools import partial
 from typing import Literal, Set
 
 import deep_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
+from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back, use_rocm
 
 
 def simulate_failure_and_skip(rank: int, api: Literal["dispatch", "combine", "clean"], expected_masked_ranks: Set[int]):
@@ -113,9 +113,9 @@ def test_main(num_tokens: int,
                             # Check expert indices
                             int_mask = (2**32) - 1
                             num_valid_tokens = recv_count.item()
-                            # cumulative_local_expert_recv_stats not currently enabled.
-                            #assert cumulative_local_expert_recv_stats[i].item(
-                            #) == num_valid_tokens, f'{cumulative_local_expert_recv_stats[i].item()} != {num_valid_tokens}'
+                            if not use_rocm:
+                                assert cumulative_local_expert_recv_stats[i].item(
+                                ) == num_valid_tokens, f'{cumulative_local_expert_recv_stats[i].item()} != {num_valid_tokens}'
                             assert num_valid_tokens == (
                                 recv_layout_range
                                 & int_mask).sum().item(), f'{num_valid_tokens} != {recv_layout_range & int_mask}.sum().item()'

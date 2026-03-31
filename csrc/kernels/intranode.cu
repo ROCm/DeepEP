@@ -631,6 +631,7 @@ template<typename dtype_t, int kNumRanks, int kNumThreads>
 __global__ void __launch_bounds__(kNumThreads, 1)
 combine(dtype_t* recv_x, float* recv_topk_weights,
         const dtype_t* x, const float* topk_weights,
+        const dtype_t* bias_0, const dtype_t* bias_1,
         const int* src_idx, const int* rank_prefix_matrix, const int* channel_prefix_matrix,
         int* send_head, int num_tokens, int num_recv_tokens, int hidden, int num_topk,
         void **buffer_ptrs, int rank,
@@ -648,6 +649,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
     constexpr int kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
     int hidden_int4 = hidden * sizeof(dtype_t) / sizeof(int4);
     auto x_int4 = reinterpret_cast<const int4*>(x);
+    auto bias_0_int4 = reinterpret_cast<const int4*>(bias_0);
+    auto bias_1_int4 = reinterpret_cast<const int4*>(bias_1);
     auto recv_int4 = reinterpret_cast<int4*>(recv_x);
     if (is_sender) {
         // Workers for sending
@@ -861,16 +864,33 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 // Reduce data
                 #pragma unroll
                 for (int i = lane_id; i < hidden_int4; i += kWarpSize) {
-                    float values[kDtypePerInt4] = {0};
+                    // Read bias
+                    int4 bias_0_value_int4 =
+                        bias_0_int4 != nullptr ? __ldg(bias_0_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
+                    int4 bias_1_value_int4 =
+                        bias_1_int4 != nullptr ? __ldg(bias_1_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0);
 
+                    // Read buffers
+                    int4 recv_value_int4[kNumRanks];
+                    #pragma unroll
+                    for (int j = 0; j < num_topk_ranks; ++j)
+                        recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
+
+                    // Reduce bias
+                    float values[kDtypePerInt4];
+                    auto bias_0_values = reinterpret_cast<const dtype_t*>(&bias_0_value_int4);
+                    auto bias_1_values = reinterpret_cast<const dtype_t*>(&bias_1_value_int4);
+                    #pragma unroll
+                    for (int j = 0; j < kDtypePerInt4; ++j)
+                        values[j] = static_cast<float>(bias_0_values[j]) + static_cast<float>(bias_1_values[j]);
+
+                    // Reduce all-to-all results
                     #pragma unroll
                     for (int j = 0; j < num_topk_ranks; ++j) {
-                        int4 recv_value = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
-                        const dtype_t* recv_dtypes = reinterpret_cast<const dtype_t*>(&recv_value);
-
+                        auto recv_value_dtypes = reinterpret_cast<const dtype_t*>(&recv_value_int4[j]);
                         #pragma unroll
                         for (int k = 0; k < kDtypePerInt4; ++k)
-                            values[k] += static_cast<float>(recv_dtypes[k]);
+                            values[k] += static_cast<float>(recv_value_dtypes[k]);
                     }
 
                     int4 out_int4;
@@ -908,6 +928,8 @@ void combine(cudaDataType_t type,
              float* recv_topk_weights,
              const void* x,
              const float* topk_weights,
+             const void* bias_0,
+             const void* bias_1,
              const int* src_idx,
              const int* rank_prefix_matrix,
              const int* channel_prefix_matrix,
@@ -929,6 +951,8 @@ void combine(cudaDataType_t type,
     LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, (combine<dtype, ranks, kNumThreads>), \
         reinterpret_cast<dtype*>(recv_x), recv_topk_weights, \
         reinterpret_cast<const dtype*>(x), topk_weights,   \
+        reinterpret_cast<const dtype*>(bias_0),             \
+        reinterpret_cast<const dtype*>(bias_1),             \
         src_idx, rank_prefix_matrix, channel_prefix_matrix, \
         send_head, num_tokens, num_recv_tokens, hidden, num_topk, \
         buffer_ptrs, rank, \

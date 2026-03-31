@@ -99,7 +99,7 @@ def test_main(args: argparse.Namespace,
     time.sleep(1)
 
     # Config
-    rdma_buffer_size, nvl_buffer_size = 512, (720 if num_ranks in (24, 48, 96, 144, 160) else 512)
+    rdma_buffer_size, nvl_buffer_size = (512 if use_rocm else 128), (720 if num_ranks in (24, 48, 96, 144, 160) else 512)
     config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
 
     # Test dispatch
@@ -114,7 +114,7 @@ def test_main(args: argparse.Namespace,
 
     for previous_mode in (False, True):
         for async_mode in (False, True):
-            for current_x in (x_pure_rand, x, x_e4m3):
+            for current_x in (x_pure_rand, x, x_pure_rand_e4m3, x_e4m3):
                 for with_topk in (False, True):
                     is_rand = current_x is x_pure_rand or current_x is x_pure_rand_e4m3
                     if local_rank == 0:
@@ -154,6 +154,7 @@ def test_main(args: argparse.Namespace,
                     assert gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist() == recv_num_tokens_per_expert_list
                     if not is_rand:
                         check_data(recv_x, recv_gbl_rank_prefix_sum)
+                    recv_topk_weights_clone = None
                     if with_topk:
                         # Check `topk_idx`
                         assert (recv_topk_idx.eq(-1) |
@@ -163,10 +164,27 @@ def test_main(args: argparse.Namespace,
                             assert recv_topk_idx.eq(i).sum().item() == count
 
                         # Check `topk_weights`
+                        recv_topk_weights_clone = recv_topk_weights.clone()
                         if not is_rand:
                             recv_topk_weights[recv_topk_idx.eq(-1)] = recv_topk_weights.amax(
                                 dim=1, keepdim=True).expand_as(recv_topk_weights)[recv_topk_idx.eq(-1)]
                             check_data(recv_topk_weights, recv_gbl_rank_prefix_sum)
+
+                    # Test `num_worst_tokens != 0`
+                    if with_topk and not use_rocm:
+                        num_worst_tokens = num_tokens * num_ranks
+                        dispatch_args.update({'num_worst_tokens': num_worst_tokens})
+                        recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, _, event = buffer.dispatch(**dispatch_args)
+                        event.current_stream_wait() if async_mode else ()
+                        recv_worst_x = per_token_cast_back(*recv_worst_x) if isinstance(recv_worst_x, tuple) else recv_worst_x
+                        assert len(empty_list) == 0
+                        assert num_worst_tokens == recv_worst_x.size(0)
+                        assert num_worst_tokens == recv_worst_topk_idx.size(0)
+                        assert num_worst_tokens == recv_worst_topk_weights.size(0)
+                        assert torch.equal(recv_x, recv_worst_x[:recv_x.size(0)])
+                        assert torch.equal(recv_topk_idx, recv_worst_topk_idx[:recv_x.size(0)])
+                        assert torch.equal(recv_topk_weights_clone, recv_worst_topk_weights[:recv_x.size(0)])
+                        assert torch.all(recv_worst_topk_idx[recv_x.size(0):] == -1).item()
 
                     # Test cached dispatch (must without top-k staffs)
                     if not with_topk:
@@ -182,8 +200,8 @@ def test_main(args: argparse.Namespace,
                     # Test combine
                     bias_0 = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
                     bias_1 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                    combine_args = {'x': recv_x, 'bias': (bias_0, bias_1), 'handle': handle, 'config': config, 'async_finish': async_mode}
                     combine_args = {'x': recv_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
+                    combine_args['bias'] = (bias_0, bias_1)
                     if with_topk:
                         combine_args.update({'topk_weights': recv_topk_weights})
                     if previous_mode:
@@ -201,7 +219,7 @@ def test_main(args: argparse.Namespace,
 
                     hash_value += hash_tensor(recv_x)
 
-                    # # For later tuning
+                    # For later tuning
                     dispatch_bf16_rdma_send_bytes = num_rdma_token_sent * hidden * 2
                     dispatch_bf16_nvl_recv_bytes = recv_x.numel() * 2
                     combine_bf16_nvl_send_bytes = dispatch_bf16_nvl_recv_bytes
@@ -298,22 +316,18 @@ def test_main(args: argparse.Namespace,
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks,  backend=args.backend)
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks, backend=args.backend)
     if args.test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
-    if (use_rocm and num_ranks < 64):
-        num_sms = 64
-    elif (use_rocm and num_ranks >= 64):
-        num_sms = 32 
-    else:
-        num_sms = 24
+
+    num_sms = (64 if num_ranks < 33 else 32) if use_rocm else 24
     num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
 
     buffer = deep_ep.Buffer(group,
-                            int(4e9),
-                            int(2e9),
+                            int(4e9) if use_rocm else int(2e9),
+                            int(2e9) if use_rocm else int(1e9),
                             low_latency_mode=args.test_ll_compatibility,
-                            num_qps_per_rank=num_qps_per_rank,                            
+                            num_qps_per_rank=num_qps_per_rank,
                             explicitly_destroy=True)
     assert num_local_ranks == 8 and num_ranks > 8
 
@@ -357,7 +371,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test internode EP kernels')
-    parser.add_argument('--backend', type=str, choices=['mpi', 'nccl'], default='nccl',help='Backend for distributed communication (mpi or nccl)')    
+    parser.add_argument('--backend', type=str, choices=['mpi', 'nccl'], default='nccl',
+                        help='Backend for distributed communication (mpi or nccl)')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
     parser.add_argument('--num-tokens', type=int, default=4096, help='Number of tokens (default: 4096)')
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden dimension size (default: 7168)')
