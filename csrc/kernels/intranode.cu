@@ -206,7 +206,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
          int* send_head, const int4* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
          const bool* is_token_in_rank, const int* channel_prefix_matrix,
-         int num_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales,
+         int num_tokens, int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales,
+         int scale_token_stride, int scale_hidden_stride,
          void **buffer_ptrs, int rank,
          int num_max_send_tokens, int num_recv_buffer_tokens) {
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
@@ -504,6 +505,18 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
             num_tokens_to_recv -= num_recv_tokens;
         }
     }
+
+    // Clean unused `recv_topk_idx` as -1
+    if (num_worst_tokens > 0) {
+        auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
+        const auto num_recv_tokens = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + rank];
+        const auto clean_start = num_recv_tokens * num_topk + sm_id * kNumThreads;
+        const auto clean_end = num_worst_tokens * num_topk;
+        const auto clean_stride = num_sms * kNumThreads;
+        #pragma unroll
+        for (int i = clean_start + thread_id; i < clean_end; i += clean_stride)
+            recv_topk_idx[i] = -1;
+    }
 }
 
 
@@ -521,13 +534,13 @@ void dispatch(void* recv_x,
               const bool* is_token_in_rank,
               const int* channel_prefix_matrix,
               int num_tokens,
-              int num_worst_tokens,//
+              int num_worst_tokens,
               int hidden_int4,
               int num_topk,
               int num_experts,
               int num_scales,
-              int scale_token_stride,//
-              int scale_hidden_stride,//
+              int scale_token_stride,
+              int scale_hidden_stride,
               void** buffer_ptrs,
               int rank,
               int num_ranks,
@@ -543,7 +556,8 @@ LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, dispatch<ranks, kNumThreads>, \
     reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, \
     send_head, reinterpret_cast<const int4*>(x), x_scales, topk_idx, topk_weights, \
     is_token_in_rank, channel_prefix_matrix, \
-    num_tokens, hidden_int4, num_topk, num_experts, num_scales, \
+    num_tokens, num_worst_tokens, hidden_int4, num_topk, num_experts, num_scales, \
+    scale_token_stride, scale_hidden_stride, \
     buffer_ptrs, rank, \
     num_max_send_tokens, num_recv_buffer_tokens); \
 break
