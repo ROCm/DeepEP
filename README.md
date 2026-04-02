@@ -75,7 +75,7 @@ python3 tests/test_low_latency.py
 ### Installation
 
 ```bash
-python3 setup.py --variant rocm --nic <NIC_TYPE>  build develop
+python3 setup.py --variant rocm --nic <NIC_TYPE> --rocm-explicit-ctx  build develop
 ```
 
 Then, import `deep_ep` in your Python project, and enjoy!
