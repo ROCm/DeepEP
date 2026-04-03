@@ -1835,4 +1835,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
     m.attr("topk_idx_t") =
         py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
+
+#ifdef AITER_MOE
+    m.attr("AITER_MOE") = true;
+#else
+    m.attr("AITER_MOE") = false;
+#endif
 }

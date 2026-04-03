@@ -24,6 +24,7 @@ if __name__ == "__main__":
     parser.add_argument("--rocm-disable-ctx", action="store_true", help="Disable workgroup context optimization in internode")
     parser.add_argument("--enable-mpi", action="store_true", help="Enable MPI detection and configuration")
     parser.add_argument("--nic", type=str, default="cx7", choices=["cx7", "thor2", "io"], help="Target NIC architecture (e.g., cx7, thor2)")
+    parser.add_argument("--aiter-moe", action="store_true", help="Enable AITER_MOE support (non-negative sentinel for invalid expert indices)")
 
     # Get the arguments to be parsed and separate setuptools arguments
     args, unknown_args = parser.parse_known_args()
@@ -34,6 +35,7 @@ if __name__ == "__main__":
     enable_mpi = args.enable_mpi
     enable_timer = args.enable_timer
     nic_type = args.nic
+    aiter_moe = args.aiter_moe
 
     # Reset sys.argv for setuptools to avoid conflicts
     sys.argv = [sys.argv[0]] + unknown_args
@@ -140,6 +142,8 @@ if __name__ == "__main__":
         define_macros.append("-DROCM_DISABLE_CTX=1")
     if rocm_explicit_ctx:
         define_macros.append("-DROCM_EXPLICIT_CTX=1")
+    if aiter_moe:
+        define_macros.append("-DAITER_MOE=1")
     if nic_type:
         nic_macro = f"-DNIC_{nic_type.upper()}=1"
         define_macros.append(nic_macro)

@@ -340,12 +340,20 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
                         // Top-k index
                         int recv_expert_begin = responsible_rank * num_experts_per_rank, recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
                         auto idx_value = __ldg(topk_idx + token_idx * num_topk + send_lane_id);
+#ifdef AITER_MOE
+                        idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : num_experts_per_rank;
+#else
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
+#endif
                         channel_topk_idx_buffers[dst_slot_idx * num_topk + send_lane_id] = idx_value;
 
                         // Top-k weights
                         auto weight_value = __ldg(topk_weights + token_idx * num_topk + send_lane_id);
+#ifdef AITER_MOE
+                        weight_value = (idx_value < num_experts_per_rank) ? weight_value : 0.0f;
+#else
                         weight_value = (idx_value >= 0) ? weight_value : 0.0f;
+#endif
                         channel_topk_weights_buffers[dst_slot_idx * num_topk + send_lane_id] = weight_value;
                     }
 

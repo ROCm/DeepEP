@@ -993,9 +993,17 @@ asm volatile(
                     auto weight_value = ld_nc_global(reinterpret_cast<float*>(shifted) + lane_id);
 
                     // Transform and write
+#ifdef AITER_MOE
+                    idx_value = (idx_value >= dst_rank_expert_begin and idx_value < dst_rank_expert_end) ? idx_value - dst_rank_expert_begin : num_experts / num_ranks;
+#else
                     idx_value = (idx_value >= dst_rank_expert_begin and idx_value < dst_rank_expert_end) ? idx_value - dst_rank_expert_begin : -1;
+#endif
                     st_na_global(nvl_channel_topk_idx.buffer() + dst_slot_idx * num_topk + lane_id, idx_value);
+#ifdef AITER_MOE
+                    weight_value = idx_value < num_experts / num_ranks ? weight_value : 0.0f;
+#else
                     weight_value = idx_value >= 0 ? weight_value : 0.0f;
+#endif
                     st_na_global(nvl_channel_topk_weights.buffer() + dst_slot_idx * num_topk + lane_id, weight_value);
                 }
 
