@@ -5,6 +5,7 @@ import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
 import deep_ep
+import deep_ep_cpp
 from utils import init_dist, bench, calc_diff, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, use_rocm
 
 # Test compatibility with low latency functions
