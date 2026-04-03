@@ -107,6 +107,7 @@ inline void LAUNCH_KERNEL_NON_COOPERATIVE(T &&config, Kern &&kernel,
         case 2: case_macro(2); \
         case 4: case_macro(4); \
         case 8: case_macro(8); \
+        case 9: case_macro(9); \
         case 16: case_macro(16); \
         default: EP_HOST_ASSERT(false and "Unsupported RDMA ranks"); \
      } while (false)
@@ -128,9 +129,10 @@ inline void LAUNCH_KERNEL_NON_COOPERATIVE(T &&config, Kern &&kernel,
 
 #define SWITCH_HIDDEN(case_macro) \
     switch (hidden) { \
+        case 2048: case_macro(2048); \
         case 2560: case_macro(2560); \
-        case 5120: case_macro(5120); \
         case 4096: case_macro(4096); \
+        case 5120: case_macro(5120); \
         case 7168: case_macro(7168); \
         default: EP_HOST_ASSERT(false && "Unsupported hidden"); \
     } while (false)

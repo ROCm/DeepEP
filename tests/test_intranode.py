@@ -5,6 +5,7 @@ import torch.distributed as dist
 
 # noinspection PyUnresolvedReferences
 import deep_ep
+import deep_ep_cpp
 from utils import init_dist, bench, calc_diff, inplace_unique, per_token_cast_to_fp8, per_token_cast_back, use_rocm
 
 # Test compatibility with low latency functions
@@ -25,10 +26,7 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     # Random data
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    if use_rocm:
-        x_e4m3 = per_token_cast_to_fp8(x)
-    else:
-        x_e4m3 = per_token_cast_to_fp8(x) if deep_ep.Buffer.is_sm90_compiled() else None
+    x_e4m3 = per_token_cast_to_fp8(x) if (use_rocm or deep_ep.Buffer.is_sm90_compiled()) else None
     x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T) if x_e4m3 is not None else None
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
@@ -39,6 +37,11 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
     rank_idx = rank_idx.to(torch.int64)
     rank_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rank_idx, num_ranks)
+
+    invalid_index = -1
+    num_experts_per_rank = num_experts // num_ranks
+    if deep_ep_cpp.AITER_MOE:
+        invalid_index = num_experts_per_rank
 
     # Expert meta
     num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
@@ -127,7 +130,7 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
                     recv_topk_weights_clone = None
                     if with_topk:
                         # Check `topk_idx`
-                        assert (recv_topk_idx.eq(-1) |
+                        assert (recv_topk_idx.eq(invalid_index) |
                                 ((recv_topk_idx >= 0) &
                                  (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
                         for i, count in enumerate(recv_num_tokens_per_expert_list):
@@ -136,8 +139,8 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
                         # Check `topk_weights`
                         recv_topk_weights_clone = recv_topk_weights.clone()
                         if current_x is not x_pure_rand:
-                            recv_topk_weights[recv_topk_idx.eq(-1)] = recv_topk_weights.amax(
-                                dim=1, keepdim=True).expand_as(recv_topk_weights)[recv_topk_idx.eq(-1)]
+                            recv_topk_weights[recv_topk_idx.eq(invalid_index)] = recv_topk_weights.amax(
+                                dim=1, keepdim=True).expand_as(recv_topk_weights)[recv_topk_idx.eq(invalid_index)]
                             check_data(recv_topk_weights, rank_prefix_matrix)
 
                     # Test `num_worst_tokens != 0`
@@ -154,8 +157,8 @@ def test_main(args: argparse.Namespace, num_sms: int, local_rank: int, num_ranks
                         assert torch.equal(recv_x, recv_worst_x[:recv_x.size(0)])
                         assert torch.equal(recv_topk_idx, recv_worst_topk_idx[:recv_x.size(0)])
                         assert torch.equal(recv_topk_weights_clone, recv_worst_topk_weights[:recv_x.size(0)])
-                        #TODO check why overflow area is not all -1.
-                        #assert torch.all(recv_worst_topk_idx[recv_x.size(0):] == -1).item()
+                        if not use_rocm:
+                            assert torch.all(recv_worst_topk_idx[recv_x.size(0):] == -1).item()
 
                     # Test cached dispatch (must without top-k staffs)
                     if not with_topk:
