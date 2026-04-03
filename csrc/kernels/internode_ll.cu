@@ -721,7 +721,7 @@ combine(void* combined_x,
 
         if constexpr (kMultinode){
             
-            if (sub_warp_id == 0 && num_ranks == 16) {
+            if (thread_id == 0 ) {
 #if defined(ROCM_EXPLICIT_CTX)
                 internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
 #elif !defined(ROCM_DISABLE_CTX)
