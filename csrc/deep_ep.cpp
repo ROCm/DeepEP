@@ -2,9 +2,13 @@
 #include <ATen/cuda/CUDADataType.h>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <memory>
+#include <mutex>
 #include <pybind11/functional.h>
+#include <thread>
 #include <torch/python.h>
 
 #include "deep_ep.hpp"
@@ -16,12 +20,13 @@ namespace deep_ep {
 // If DEEPEP_TIMEOUT_AS_WARNING=1, emit a warning instead of throwing on CPU
 // recv timeout. Useful when CPU activity dumping inflates timing artificially.
 static bool cpu_timeout_as_warning() {
-    static int cached = -1;
-    if (cached < 0) {
+    static bool result;
+    static std::once_flag flag;
+    std::call_once(flag, [] {
         const char* env = std::getenv("DEEPEP_TIMEOUT_AS_WARNING");
-        cached = (env != nullptr && env[0] == '1') ? 1 : 0;
-    }
-    return cached == 1;
+        result = (env != nullptr && env[0] == '1');
+    });
+    return result;
 }
 
 // In warning mode: prints once per process and returns false (caller keeps polling).
@@ -586,6 +591,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                     NUM_CPU_TIMEOUT_SECS) {
                     if (handle_cpu_timeout("CPU recv timeout"))
                         break;
+                    // Warning mode: back off to avoid busy-spinning, then re-arm the timeout window.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    start_time = std::chrono::high_resolution_clock::now();
                 }
             }
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
@@ -1110,6 +1118,9 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                     NUM_CPU_TIMEOUT_SECS) {
                     if (handle_cpu_timeout("timeout (dispatch CPU)"))
                         break;
+                    // Warning mode: back off to avoid busy-spinning, then re-arm the timeout window.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    start_time = std::chrono::high_resolution_clock::now();
                 }
             }
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
