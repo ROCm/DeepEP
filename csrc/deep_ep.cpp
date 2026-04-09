@@ -24,14 +24,16 @@ static bool cpu_timeout_as_warning() {
     return cached == 1;
 }
 
-static void handle_cpu_timeout(const char* msg) {
+// In warning mode: prints once per process and returns false (caller keeps polling).
+// In error mode: throws (never returns).
+static bool handle_cpu_timeout(const char* msg) {
     if (cpu_timeout_as_warning()) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
             fprintf(stderr, "DeepEP warning: %s (continuing; set DEEPEP_TIMEOUT_AS_WARNING=0 to make this an error)\n", msg);
-    } else {
-        throw std::runtime_error(std::string("DeepEP error: ") + msg);
+        return false; // keep polling until tokens arrive
     }
+    throw std::runtime_error(std::string("DeepEP error: ") + msg);
 }
 
 Buffer::Buffer(int rank,
@@ -582,8 +584,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
                     NUM_CPU_TIMEOUT_SECS) {
-                    handle_cpu_timeout("CPU recv timeout");
-                    break;
+                    if (handle_cpu_timeout("CPU recv timeout"))
+                        break;
                 }
             }
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
@@ -1106,8 +1108,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
                     NUM_CPU_TIMEOUT_SECS) {
-                    handle_cpu_timeout("timeout (dispatch CPU)");
-                    break;
+                    if (handle_cpu_timeout("timeout (dispatch CPU)"))
+                        break;
                 }
             }
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
