@@ -291,8 +291,15 @@ def test_main(args: argparse.Namespace,
 
     # Tune combine performance
     best_time, best_results = 1e10, None
-    for nvl_chunk_size in range(1, 8, 1):
-        for rdma_chunk_size in range(12 if num_nodes == 2 else 8, 33, 4):
+    if num_nodes <= 2:
+        combine_rdma_range = range(12, 33, 4)
+    elif num_nodes <= 8:
+        combine_rdma_range = range(8, 33, 4)
+    else:
+        combine_rdma_range = range(4, 17, 4)
+    combine_nvl_max = 4 if num_nodes > 8 else 8
+    for nvl_chunk_size in range(1, combine_nvl_max, 1):
+        for rdma_chunk_size in combine_rdma_range:
             config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
             tune_args = {'x': recv_x, 'handle': handle, 'config': config}
             t, notify_t = bench_kineto(
@@ -326,7 +333,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if args.test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
-    num_sms = (64 if num_ranks < 33 else 32) if use_rocm else 24
+    num_sms = (64 if num_ranks <= 32 else 32 if num_ranks <= 64 else 16) if use_rocm else 24
     num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
 
     buffer = deep_ep.Buffer(group,
