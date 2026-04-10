@@ -19,18 +19,25 @@ namespace deep_ep {
 namespace internode_ll {
 
 __device__ void grid_barrier(int* global_counter, int num_blocks) {
-    volatile int ret;
+    int ret;
     __syncthreads();
-    if (threadIdx.x == 0 ) {
+    if (threadIdx.x == 0) {
         __threadfence();
-	    ret = __hip_atomic_fetch_add( &global_counter[0], 1,
+        ret = __hip_atomic_fetch_add(&global_counter[0], 1,
                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        while (__hip_atomic_load(global_counter,
-                 __ATOMIC_RELAXED,
-                 __HIP_MEMORY_SCOPE_AGENT) != num_blocks);
+        if (ret == num_blocks - 1) {
+            __hip_atomic_store(&global_counter[0], 0,
+                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        } else {
+            while (true) {
+                int val = __hip_atomic_load(global_counter,
+                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                if (val == num_blocks || val == 0) break;
+            }
+        }
     }
     __syncthreads();
 }
@@ -264,7 +271,11 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
 
                 // Increase counter after finishing
                 syncwarp();
-                lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
+                // This is necessary to guarantee that payload writes are completed before the flag is updated.
+                __atomic_signal_fence(__ATOMIC_SEQ_CST);
+                __builtin_amdgcn_s_waitcnt(0);
+                __atomic_signal_fence(__ATOMIC_SEQ_CST);
+                lane_id == 0 ? atomic_add_relaxed_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
     } if (warp_id == num_warps - 1) {
@@ -282,7 +293,7 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
                 syncwarp();
                 #pragma unroll 4
                 for (int i = lane_id;i < num_experts;i += kWarpSize)
-                    atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
+                    atomic_add_relaxed_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
             }
         }
         // This SM should be responsible for some destination experts, read `topk_idx` for them
@@ -304,11 +315,8 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
             auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
             if (lane_id == 0) {
                 shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
-                if constexpr (kMultinode){
-                    atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
-                }else{
-                    atomic_add_relaxed_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
-                }
+                atomic_add_relaxed_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+                
             }
         }
     }
@@ -338,7 +346,7 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
 
         // Wait local sends issued and send expert counts
         if constexpr(kMultinode){
-            while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
+            while (ld_volatile_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         }else{
             while (ld_volatile_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG);
         }
@@ -428,7 +436,7 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
         if (sub_warp_id == 0 and lane_id == 0) {
             auto start_time = clock64();
             if constexpr (kMultinode){
-                while ((num_recv_tokens = ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
+                while ((num_recv_tokens = ld_relaxed_sys_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
                     if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
                         printf("dispatch recieve time out \\n");
                     }
@@ -721,7 +729,7 @@ combine(void* combined_x,
 
         if constexpr (kMultinode){
             
-            if (thread_id == 0 ) {
+            if (thread_id == 0 && num_ranks == 16) {
 #if defined(ROCM_EXPLICIT_CTX)
                 internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
 #elif !defined(ROCM_DISABLE_CTX)
@@ -740,11 +748,7 @@ combine(void* combined_x,
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
 #endif
         if (sub_warp_id == 0 and lane_id == 0) {
-            if constexpr (kMultinode){
-                while (ld_acquire_global(atomic_clean_flag) == 0);
-            }else{
-                while (ld_volatile_global(atomic_clean_flag) == 0);
-            }
+            while (ld_volatile_global(atomic_clean_flag) == 0);
 
             if (dst_rank != rank) {
 #ifdef USE_ROCM
@@ -790,7 +794,7 @@ combine(void* combined_x,
         // EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0){
             if constexpr (kMultinode){
-                while (ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
+                while (ld_relaxed_sys_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
             }else{
                 while (ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
             }

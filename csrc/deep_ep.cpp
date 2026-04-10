@@ -1506,9 +1506,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-#ifdef USE_ROCM
-    cudaMemsetAsync(dispatch_global_atomic_counter, 0, sizeof(int), launch_stream);
-#endif
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
@@ -1664,9 +1661,6 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-#ifdef USE_ROCM
-    cudaMemsetAsync(combine_global_atomic_counter, 0, sizeof(int), launch_stream);
-#endif
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
