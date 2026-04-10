@@ -436,7 +436,7 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
         if (sub_warp_id == 0 and lane_id == 0) {
             auto start_time = clock64();
             if constexpr (kMultinode){
-                while ((num_recv_tokens = ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
+                while ((num_recv_tokens = ld_relaxed_sys_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
                     if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
                         printf("dispatch recieve time out \\n");
                     }
@@ -731,7 +731,7 @@ combine(void* combined_x,
             
             if (thread_id == 0 && num_ranks == 16) {
 #if defined(ROCM_EXPLICIT_CTX)
-                //internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
+                internode::shmem_ctx_quiet(rocshmem_ctx_array[local_expert_idx]);
 #elif !defined(ROCM_DISABLE_CTX)
                 internode::shmem_ctx_quiet(ctx);
 #else
@@ -794,7 +794,7 @@ combine(void* combined_x,
         // EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0){
             if constexpr (kMultinode){
-                while (ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
+                while (ld_relaxed_sys_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
             }else{
                 while (ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
             }
