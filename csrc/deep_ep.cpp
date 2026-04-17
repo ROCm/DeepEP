@@ -2,9 +2,13 @@
 #include <ATen/cuda/CUDADataType.h>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <memory>
+#include <mutex>
 #include <pybind11/functional.h>
+#include <thread>
 #include <torch/python.h>
 
 #include "deep_ep.hpp"
@@ -12,6 +16,30 @@
 #include "kernels/configs.cuh"
 
 namespace deep_ep {
+
+// If DEEPEP_TIMEOUT_AS_WARNING=1, emit a warning instead of throwing on CPU
+// recv timeout. Useful when CPU activity dumping inflates timing artificially.
+static bool cpu_timeout_as_warning() {
+    static bool result;
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+        const char* env = std::getenv("DEEPEP_TIMEOUT_AS_WARNING");
+        result = (env != nullptr && env[0] == '1');
+    });
+    return result;
+}
+
+// In warning mode: prints once per process and returns false (caller keeps polling).
+// In error mode: throws (never returns).
+static bool handle_cpu_timeout(const char* msg) {
+    if (cpu_timeout_as_warning()) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            fprintf(stderr, "DeepEP warning: %s (continuing; set DEEPEP_TIMEOUT_AS_WARNING=0 to make this an error)\n", msg);
+        return false; // keep polling until tokens arrive
+    }
+    throw std::runtime_error(std::string("DeepEP error: ") + msg);
+}
 
 Buffer::Buffer(int rank,
                int num_ranks,
@@ -560,8 +588,13 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                     break;
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
-                    NUM_CPU_TIMEOUT_SECS)
-                    throw std::runtime_error("DeepEP error: CPU recv timeout");
+                    NUM_CPU_TIMEOUT_SECS) {
+                    if (handle_cpu_timeout("CPU recv timeout"))
+                        break;
+                    // Warning mode: back off to avoid busy-spinning, then re-arm the timeout window.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    start_time = std::chrono::high_resolution_clock::now();
+                }
             }
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }
@@ -1083,7 +1116,11 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
                     NUM_CPU_TIMEOUT_SECS) {
-                    throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
+                    if (handle_cpu_timeout("timeout (dispatch CPU)"))
+                        break;
+                    // Warning mode: back off to avoid busy-spinning, then re-arm the timeout window.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    start_time = std::chrono::high_resolution_clock::now();
                 }
             }
             num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
