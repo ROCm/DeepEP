@@ -356,9 +356,21 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
                 rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
             }else{
                 __threadfence_system();
-                if (dst_rank / NUM_MAX_NVL_PEERS == rank / NUM_MAX_NVL_PEERS ){
-                    rocshmem::rocshmem_ctx_long_p(rocshmem_ctx_array[dst_expert_local_idx], rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
-                }else{
+                    if (dst_rank / NUM_MAX_NVL_PEERS == rank / NUM_MAX_NVL_PEERS ){
+#if defined(ROCM_EXPLICIT_CTX)
+                        rocshmem::rocshmem_ctx_long_p(rocshmem_ctx_array[dst_expert_local_idx],
+                            rdma_recv_count + dst_expert_local_idx * num_ranks + rank,
+                            -num_tokens_sent - 1, dst_rank);
+#elif !defined(ROCM_DISABLE_CTX)
+                        rocshmem::rocshmem_ctx_long_p(ctx,
+                            rdma_recv_count + dst_expert_local_idx * num_ranks + rank,
+                            -num_tokens_sent - 1, dst_rank);
+#else
+                        rocshmem::rocshmem_long_p(
+                            rdma_recv_count + dst_expert_local_idx * num_ranks + rank,
+                            -num_tokens_sent - 1, dst_rank);
+#endif
+                    }else{
 #if defined(ROCM_EXPLICIT_CTX)
                     internode::shmem_ctx_long_atomic_add(rocshmem_ctx_array[dst_expert_local_idx], rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
 #elif !defined(ROCM_DISABLE_CTX)
@@ -366,7 +378,7 @@ dispatch(void* packed_recv_x,  void* packed_recv_x_scales,
 #else
                     internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
 #endif
-                }
+                    }
             }
 #else //CUDA
            nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
@@ -757,16 +769,24 @@ combine(void* combined_x,
                 } else {
                     __threadfence_system();
                     if (dst_rank / NUM_MAX_NVL_PEERS == rank / NUM_MAX_NVL_PEERS ){
-                        rocshmem::rocshmem_ctx_long_p(rocshmem_ctx_array[local_expert_idx], rdma_recv_flag + global_expert_idx, 1, dst_rank);
+#if defined(ROCM_EXPLICIT_CTX)
+                        rocshmem::rocshmem_ctx_long_p(rocshmem_ctx_array[local_expert_idx],
+                            rdma_recv_flag + global_expert_idx, 1, dst_rank);
+#elif !defined(ROCM_DISABLE_CTX)
+                        rocshmem::rocshmem_ctx_long_p(ctx,
+                            rdma_recv_flag + global_expert_idx, 1, dst_rank);
+#else
+                        rocshmem::rocshmem_long_p(
+                            rdma_recv_flag + global_expert_idx, 1, dst_rank);
+#endif
                     }else{
-
 #if defined(ROCM_EXPLICIT_CTX)
                         internode::shmem_ctx_long_atomic_add(rocshmem_ctx_array[local_expert_idx], rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #elif !defined(ROCM_DISABLE_CTX)
                         internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #else
                         internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
-#endif //DISABLE_CTX
+#endif
                     }
                 }
 #else
