@@ -808,8 +808,20 @@ extract_required_scale_format(float value) {
 
 #ifdef USE_ROCM 
 constexpr float kFP8Margin = 1e-4;
+#if defined(__gfx942__)
+// gfx942 uses HIP E4M3 FNUZ conversion in the ROCm dispatch path. Match
+// vLLM's dynamic-quantization clamp for this dtype instead of torch.finfo's
+// wider 240 bound.
+constexpr float kFinfoAmaxE4M3 = 224.0f;
+constexpr float kFinfoAmaxInvE4M3 = 1 / 224.0f;
+#elif defined(__gfx950__)
+// gfx950 uses HIP E4M3, whose finite range matches the OCP/NVIDIA E4M3 bound.
+constexpr float kFinfoAmaxE4M3 = 448.0f;
+constexpr float kFinfoAmaxInvE4M3 = 1 / 448.0f;
+#else
 constexpr float kFinfoAmaxE4M3 = 240.0f;
 constexpr float kFinfoAmaxInvE4M3 = 1 / 240.0f;
+#endif
 #else
 constexpr float kFP8Margin = 1e-4;
 constexpr float kFinfoAmaxE4M3 = 448.0f;
