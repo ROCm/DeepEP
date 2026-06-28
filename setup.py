@@ -25,6 +25,15 @@ if __name__ == "__main__":
     parser.add_argument("--enable-mpi", action="store_true", help="Enable MPI detection and configuration")
     parser.add_argument("--nic", type=str, default="cx7", choices=["cx7", "thor2", "io"], help="Target NIC architecture (e.g., cx7, thor2)")
     parser.add_argument("--aiter-moe", action="store_true", help="Enable AITER_MOE support (non-negative sentinel for invalid expert indices)")
+    parser.add_argument(
+        "--rocm-gfx942-fp8-fnuz-max",
+        type=float,
+        default=None,
+        help=(
+            "Override the gfx942 ROCm E4M3 FNUZ dynamic FP8 scaling bound. "
+            "Defaults to PyTorch's reported 240.0 if unset."
+        ),
+    )
 
     # Get the arguments to be parsed and separate setuptools arguments
     args, unknown_args = parser.parse_known_args()
@@ -36,6 +45,7 @@ if __name__ == "__main__":
     enable_timer = args.enable_timer
     nic_type = args.nic
     aiter_moe = args.aiter_moe
+    rocm_gfx942_fp8_fnuz_max = args.rocm_gfx942_fp8_fnuz_max
 
     # Reset sys.argv for setuptools to avoid conflicts
     sys.argv = [sys.argv[0]] + unknown_args
@@ -144,6 +154,27 @@ if __name__ == "__main__":
         define_macros.append("-DROCM_EXPLICIT_CTX=1")
     if aiter_moe:
         define_macros.append("-DAITER_MOE=1")
+    if variant == "rocm":
+        env_fp8_fnuz_max = os.getenv("DEEPEP_ROCM_GFX942_FP8_FNUZ_MAX", "").strip()
+        if rocm_gfx942_fp8_fnuz_max is None and env_fp8_fnuz_max:
+            rocm_gfx942_fp8_fnuz_max = float(env_fp8_fnuz_max)
+        if rocm_gfx942_fp8_fnuz_max is not None:
+            if rocm_gfx942_fp8_fnuz_max <= 0:
+                raise ValueError(
+                    "--rocm-gfx942-fp8-fnuz-max must be greater than 0"
+                )
+            fp8_fnuz_max_macro = f"{rocm_gfx942_fp8_fnuz_max:.9g}"
+            if "." not in fp8_fnuz_max_macro and "e" not in fp8_fnuz_max_macro.lower():
+                fp8_fnuz_max_macro += ".0"
+            fp8_fnuz_max_macro += "f"
+            define_macros.append(
+                "-DDEEPEP_ROCM_GFX942_FP8_FNUZ_MAX="
+                f"{fp8_fnuz_max_macro}"
+            )
+            print(
+                "Using gfx942 ROCm FP8 FNUZ max override: "
+                f"{fp8_fnuz_max_macro}"
+            )
     if nic_type:
         nic_macro = f"-DNIC_{nic_type.upper()}=1"
         define_macros.append(nic_macro)

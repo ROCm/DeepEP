@@ -809,11 +809,14 @@ extract_required_scale_format(float value) {
 #ifdef USE_ROCM 
 constexpr float kFP8Margin = 1e-4;
 #if defined(__gfx942__)
-// gfx942 uses HIP E4M3 FNUZ conversion in the ROCm dispatch path. Match
-// vLLM's dynamic-quantization clamp for this dtype instead of torch.finfo's
-// wider 240 bound.
-constexpr float kFinfoAmaxE4M3 = 224.0f;
-constexpr float kFinfoAmaxInvE4M3 = 1 / 224.0f;
+#ifndef DEEPEP_ROCM_GFX942_FP8_FNUZ_MAX
+#define DEEPEP_ROCM_GFX942_FP8_FNUZ_MAX 240.0f
+#endif
+// gfx942 uses HIP E4M3 FNUZ conversion in the ROCm dispatch path. Keep
+// PyTorch's reported finfo max by default, while allowing downstream builds
+// to select a stricter bound for model-accuracy compatibility.
+constexpr float kFinfoAmaxE4M3 = DEEPEP_ROCM_GFX942_FP8_FNUZ_MAX;
+constexpr float kFinfoAmaxInvE4M3 = 1 / DEEPEP_ROCM_GFX942_FP8_FNUZ_MAX;
 #elif defined(__gfx950__)
 // gfx950 uses HIP E4M3, whose finite range matches the OCP/NVIDIA E4M3 bound.
 constexpr float kFinfoAmaxE4M3 = 448.0f;
