@@ -8,6 +8,58 @@ namespace deep_ep {
 
 namespace intranode {
 
+#ifdef USE_ROCM
+struct WorkgroupWarpBarrier {
+    int count;
+    int phase;
+};
+
+__device__ __forceinline__ void
+init_workgroup_warp_barrier(WorkgroupWarpBarrier* barrier) {
+    barrier->count = 0;
+    barrier->phase = 0;
+}
+
+__device__ __forceinline__ void
+wait_workgroup_warp_barrier(WorkgroupWarpBarrier* barrier,
+                            int expected_warps,
+                            bool is_warp_leader) {
+    // Each participating wave publishes its work through its leader. The last
+    // leader then releases the new phase to every other wave in this group.
+    syncwarp();
+    if (is_warp_leader) {
+        const int phase = __hip_atomic_load(
+            &barrier->phase,
+            __ATOMIC_ACQUIRE,
+            __HIP_MEMORY_SCOPE_WORKGROUP);
+        const int ticket = __hip_atomic_fetch_add(
+            &barrier->count,
+            1,
+            __ATOMIC_ACQ_REL,
+            __HIP_MEMORY_SCOPE_WORKGROUP);
+        if (ticket == expected_warps - 1) {
+            __hip_atomic_store(
+                &barrier->count,
+                0,
+                __ATOMIC_RELAXED,
+                __HIP_MEMORY_SCOPE_WORKGROUP);
+            __hip_atomic_store(
+                &barrier->phase,
+                phase ^ 1,
+                __ATOMIC_RELEASE,
+                __HIP_MEMORY_SCOPE_WORKGROUP);
+        } else {
+            while (__hip_atomic_load(
+                       &barrier->phase,
+                       __ATOMIC_ACQUIRE,
+                       __HIP_MEMORY_SCOPE_WORKGROUP) == phase)
+                __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    syncwarp();
+}
+#endif
+
 template<int kNumRanks>
 __global__ void
 notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
@@ -215,6 +267,15 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
     const bool is_sender = sm_id % 2 == 0;
     EP_DEVICE_ASSERT(num_sms % 2 == 0);
 
+#ifdef USE_ROCM
+    // Rank groups can execute a different number of queue rounds. A full
+    // workgroup barrier would therefore deadlock or pair unrelated rounds.
+    __shared__ WorkgroupWarpBarrier rank_barriers[kNumRanks];
+    if (thread_id < kNumRanks)
+        init_workgroup_warp_barrier(&rank_barriers[thread_id]);
+    __syncthreads();
+#endif
+
     // Several warps are response for a single rank
     const auto num_threads_per_rank = kNumThreads / kNumRanks;
     const auto num_channels = num_sms / 2;
@@ -292,7 +353,12 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
             auto start_time = wall_clock64();
             while (send_lane_id == 0) {
                 // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
-                int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
+                int num_used_slots = cached_channel_tail_idx -
+#if defined(USE_ROCM)
+                                     ld_acquire_sys_global(channel_head_idx.buffer());
+#else
+                                     ld_volatile_global(channel_head_idx.buffer());
+#endif
                 if (num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens)
                     break;
 
@@ -369,21 +435,17 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
 
             // Move tail index
             // NOTES: here all warps should share the same new tail
-#if defined(USE_ROCM) 
-            if (num_threads_per_rank > kWarpSize){
-                __syncthreads();
-            }else{
-                syncwarp();
-            }
+#if defined(USE_ROCM)
+            wait_workgroup_warp_barrier(
+                &rank_barriers[responsible_rank],
+                num_send_warps_per_rank,
+                send_lane_id == 0);
 #else
             asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
 #endif
             if (send_warp_id_in_rank == 0 and send_lane_id == 0)
-#if defined(USE_ROCM)
-                st_relaxed_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
-#else
-                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
-#endif
+                st_release_sys_global(
+                    channel_tail_idx.buffer(), cached_channel_tail_idx);
         }
     } else {
         // Workers for receiving and copying into buffer
@@ -422,11 +484,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
         while (num_tokens_to_recv > 0) {
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by different warps are same
             while (recv_thread_id_in_rank == 0) {
-#if defined(USE_ROCM)
-                cached_channel_tail_idx = ld_relaxed_sys_global(channel_tail_idx.buffer());
-#else
                 cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
-#endif
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
@@ -443,12 +501,11 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
             }
 
             // Synchronize queue tail
-#if defined(USE_ROCM) 
-            if (num_threads_per_rank > kWarpSize){
-                __syncthreads();
-            }else{
-                syncwarp();
-            }
+#if defined(USE_ROCM)
+            wait_workgroup_warp_barrier(
+                &rank_barriers[responsible_rank],
+                num_recv_warps_per_rank,
+                recv_lane_id == 0);
 #else
             asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
 #endif
@@ -497,17 +554,22 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-#if defined(USE_ROCM) 
-            if (num_threads_per_rank > kWarpSize){
-                __syncthreads();
-            }else{
-                syncwarp();
-            }
+#if defined(USE_ROCM)
+            wait_workgroup_warp_barrier(
+                &rank_barriers[responsible_rank],
+                num_recv_warps_per_rank,
+                recv_lane_id == 0);
 #else
             asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
 #endif
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and recv_lane_id == 0)
-                st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
+#if defined(USE_ROCM)
+                st_release_sys_global(
+                    channel_head_idx.buffer(), cached_channel_head_idx);
+#else
+                st_relaxed_sys_global(
+                    channel_head_idx.buffer(), cached_channel_head_idx);
+#endif
 
             // Exit
             num_tokens_to_recv -= num_recv_tokens;
@@ -666,6 +728,13 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
     const bool is_sender = sm_id % 2 == 0;
     const int responsible_channel = sm_id / 2;
 
+#ifdef USE_ROCM
+    __shared__ WorkgroupWarpBarrier rank_barriers[kNumRanks];
+    if (thread_id < kNumRanks)
+        init_workgroup_warp_barrier(&rank_barriers[thread_id]);
+    __syncthreads();
+#endif
+
     EP_DEVICE_ASSERT(num_topk <= kWarpSize);
 
     constexpr int kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
@@ -716,7 +785,12 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
             while (lane_id == 0) {
                 // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
-                int num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
+                int num_used_slots = current_channel_tail_idx -
+#if defined(USE_ROCM)
+                                     ld_acquire_sys_global(channel_head_idx.buffer());
+#else
+                                     ld_volatile_global(channel_head_idx.buffer());
+#endif
                 if (num_recv_buffer_tokens - num_used_slots >= num_round_tokens)
                     break;
 
@@ -755,21 +829,17 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-#if defined(USE_ROCM) 
-            if (num_threads_per_rank > kWarpSize){
-                __syncthreads();
-            }else{
-                syncwarp();
-            }
+#if defined(USE_ROCM)
+            wait_workgroup_warp_barrier(
+                &rank_barriers[send_rank_id],
+                num_send_warps_per_rank,
+                lane_id == 0);
 #else
             asm volatile("bar.sync %0, %1;" :: "r"(send_rank_id), "r"(num_threads_per_rank));
 #endif
             if (lane_id == 0 and send_warp_id_in_rank == 0)
-#if defined(USE_ROCM)
-                st_relaxed_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
-#else
-                st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
-#endif
+                st_release_sys_global(
+                    channel_tail_idx.buffer(), current_channel_tail_idx);
         }
     } else {
         // Workers for receiving
@@ -780,11 +850,21 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         EP_DEVICE_ASSERT(thread_id >= 0 and kNumThreads % kWarpSize == 0);
 
         // Shared head, tail and retired flags for receiver warps
+#if defined(USE_ROCM)
+        __shared__ int warp_channel_head_idx[num_recv_warps][kNumRanks];
+        __shared__ int channel_tail_idx[kNumRanks];
+        __shared__ int warp_retired[num_recv_warps];
+#else
         __shared__ volatile int warp_channel_head_idx[num_recv_warps][kNumRanks];
         __shared__ volatile int channel_tail_idx[kNumRanks];
         __shared__ volatile bool warp_retired[num_recv_warps];
+#endif
         if (thread_id < num_recv_warps)
+#if defined(USE_ROCM)
+            warp_retired[thread_id] = 0;
+#else
             warp_retired[thread_id] = false;
+#endif
         if (lane_id < kNumRanks)
             warp_channel_head_idx[recv_warp_id][lane_id] = 0;
         if (thread_id < kNumRanks)
@@ -805,24 +885,49 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 bool retired = true;
                 #pragma unroll
                 for (int i = 1; i < num_recv_warps; ++ i)
+#if defined(USE_ROCM)
+                    retired = retired and ld_acquire_cta(&warp_retired[i]);
+#else
                     retired = retired and warp_retired[i];
+#endif
                 if (retired)
                     break;
 
-                // Update queue tail
 #if defined(USE_ROCM)
-                channel_tail_idx[lane_id] = ld_relaxed_sys_global(channel_tail_idx_ptr);
+                // Bridge the producer's system-scoped tail publication to the
+                // receiver waves through a workgroup-scoped release.
+                st_release_cta(
+                    &channel_tail_idx[lane_id],
+                    ld_acquire_sys_global(channel_tail_idx_ptr));
 #else
-                channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr);
+                channel_tail_idx[lane_id] =
+                    ld_acquire_sys_global(channel_tail_idx_ptr);
 #endif
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
                 #pragma unroll
-                for (int i = 1; i < num_recv_warps; ++ i) if (not warp_retired[i])
-                    min_head = min(min_head, warp_channel_head_idx[i][lane_id]);
+                for (int i = 1; i < num_recv_warps; ++ i)
+#if defined(USE_ROCM)
+                    if (not ld_acquire_cta(&warp_retired[i]))
+                        min_head = min(
+                            min_head,
+                            ld_acquire_cta(
+                                &warp_channel_head_idx[i][lane_id]));
+#else
+                    if (not warp_retired[i])
+                        min_head = min(
+                            min_head,
+                            warp_channel_head_idx[i][lane_id]);
+#endif
                 if (min_head != std::numeric_limits<int>::max() and min_head > last_head)
-                    st_relaxed_sys_global(channel_head_idx_ptr, last_head = min_head);
+#if defined(USE_ROCM)
+                    st_release_sys_global(
+                        channel_head_idx_ptr, last_head = min_head);
+#else
+                    st_relaxed_sys_global(
+                        channel_head_idx_ptr, last_head = min_head);
+#endif
             }
         } else {
             // Receivers
@@ -861,15 +966,40 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
 
                 auto start_time = wall_clock64();
-                while (__any_sync(kFullWarpMask, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
-                // while (channel_tail_idx[lane_id] <= expected_head and expected_head >= 0) {
+#if defined(USE_ROCM)
+                int observed_tail = lane_id < kNumRanks and expected_head >= 0
+                                        ? ld_acquire_cta(
+                                              &channel_tail_idx[lane_id])
+                                        : 0;
+                while (__any_sync(
+                    kFullWarpMask,
+                    lane_id < kNumRanks and expected_head >= 0 and
+                        observed_tail <= expected_head)) {
                     // Timeout check
                     long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
                     if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n", rank, responsible_channel, expected_head);
                         trap();
                     }
+                    if (lane_id < kNumRanks and expected_head >= 0)
+                        observed_tail = ld_acquire_cta(
+                            &channel_tail_idx[lane_id]);
                 }
+#else
+                while (__any_sync(
+                    kFullWarpMask,
+                    channel_tail_idx[lane_id] <= expected_head and
+                        expected_head >= 0)) {
+                    // Timeout check
+                    long long int elapsed_time = wall_clock64() > start_time
+                                                    ? wall_clock64() - start_time
+                                                    : 0;
+                    if (elapsed_time > NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n", rank, responsible_channel, expected_head);
+                        trap();
+                    }
+                }
+#endif
                 syncwarp();
 
                 // Broadcast current heads
@@ -933,14 +1063,31 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 }
 
                 // Update head
+#if defined(USE_ROCM)
+                syncwarp();
                 if (lane_id < kNumRanks)
-                    warp_channel_head_idx[recv_warp_id][lane_id] = (expected_head < 0) ? -expected_head - 1 : expected_head + 1;
+                    st_release_cta(
+                        &warp_channel_head_idx[recv_warp_id][lane_id],
+                        (expected_head < 0)
+                            ? -expected_head - 1
+                            : expected_head + 1);
+#else
+                if (lane_id < kNumRanks)
+                    warp_channel_head_idx[recv_warp_id][lane_id] =
+                        (expected_head < 0)
+                            ? -expected_head - 1
+                            : expected_head + 1;
+#endif
             }
 
             // Retired
             syncwarp();
             if (lane_id == 0)
+#if defined(USE_ROCM)
+                st_release_cta(&warp_retired[recv_warp_id], 1);
+#else
                 warp_retired[recv_warp_id] = true;
+#endif
         }
     }
 }
