@@ -32,6 +32,27 @@ MPI_ROOT=$BUILD_DIR/ompi ../rocSHMEM/scripts/build_configs/gda_mlx5 --fresh \
 # You may pass additional arguments to Cmake,
 #   e.g., -DBUILD_LOCAL_GPU_TARGET_ONLY=ON
 ```
+
+## How DeepEP locates rocSHMEM
+
+When building the ROCm variant (`python setup.py build --variant rocm`), DeepEP
+searches for rocSHMEM in the following order:
+
+1. **`ROCSHMEM_DIR` environment variable** - an explicit install prefix
+   containing `include/` and `lib/`.
+2. **Standalone build at `$HOME/rocshmem`** - the default location produced by
+   the build steps above.
+3. **Bundled inside the ROCm installation** (`$ROCM_HOME`, e.g. `/opt/rocm`) -
+   detected automatically when rocSHMEM headers/libraries are shipped as part of
+   ROCm (`include/rocshmem.h`, `include/rocshmem/rocshmem.hpp`,
+   `lib/librocshmem.a`, or `lib/librocshmem.so`). In this case DeepEP defines the
+   `ROCSHMEM_IN_ROCM` build macro and links against the shared library when a
+   static archive is not available.
+
+If you installed rocSHMEM as part of ROCm, you do **not** need to build it
+standalone or set `ROCSHMEM_DIR` - the steps above are only required when
+building rocSHMEM yourself.
+
 # pytorch patch 
 
 Follow the below instruction for pytorch commits older than [e4adf5d](https://github.com/pytorch/pytorch/commit/e4adf5df39d9c472c7dcbac18efde29241e238f0).
