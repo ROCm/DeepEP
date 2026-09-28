@@ -64,15 +64,37 @@ if __name__ == "__main__":
         print(f'ROCm directory: {os.environ["ROCM_HOME"]}')
 
     shmem_variant_name = "NVSHMEM" if variant == "cuda" else "rocSHMEM"
-    shmem_dir = (
-        os.getenv("NVSHMEM_DIR", None)
-        if variant == "cuda"
-        else os.getenv("ROCSHMEM_DIR", f'{os.getenv("HOME")}/rocshmem')
-    )
+    # Whether rocSHMEM is provided as part of the ROCm installation (e.g. /opt/rocm)
+    # rather than as a standalone build (ROCSHMEM_DIR or ~/rocshmem).
+    rocshmem_in_rocm = False
+    if variant == "cuda":
+        shmem_dir = os.getenv("NVSHMEM_DIR", None)
+    else:
+        shmem_dir = os.getenv("ROCSHMEM_DIR", None)
+        if shmem_dir is None:
+            standalone_dir = f'{os.getenv("HOME")}/rocshmem'
+            rocm_has_rocshmem = any(
+                os.path.exists(os.path.join(rocm_path, *rel))
+                for rel in (
+                    ("include", "rocshmem.h"),
+                    ("include", "rocshmem", "rocshmem.hpp"),
+                    ("lib", "librocshmem.a"),
+                    ("lib", "librocshmem.so"),
+                )
+            )
+            if os.path.exists(standalone_dir):
+                shmem_dir = standalone_dir
+            elif rocm_has_rocshmem:
+                shmem_dir = rocm_path
+                rocshmem_in_rocm = True
+        else:
+            rocshmem_in_rocm = os.path.abspath(shmem_dir) == os.path.abspath(rocm_path)
     assert shmem_dir is not None and os.path.exists(
         shmem_dir
     ), f"Failed to find {shmem_variant_name}"
     print(f"{shmem_variant_name} directory: {shmem_dir}")
+    if variant == "rocm" and rocshmem_in_rocm:
+        print("Detected rocSHMEM bundled within the ROCm installation")
 
     ompi_dir = None
     if variant == "rocm" and enable_mpi:
@@ -152,6 +174,8 @@ if __name__ == "__main__":
         define_macros.append("-DROCM_DISABLE_CTX=1")
     if rocm_explicit_ctx:
         define_macros.append("-DROCM_EXPLICIT_CTX=1")
+    if variant == "rocm" and rocshmem_in_rocm:
+        define_macros.append("-DROCSHMEM_IN_ROCM=1")
     if aiter_moe:
         define_macros.append("-DAITER_MOE=1")
     if variant == "rocm":
@@ -228,7 +252,12 @@ if __name__ == "__main__":
     shmem_lib_name = "nvshmem" if variant == "cuda" else "rocshmem"
     # Disable DLTO (default by PyTorch)
     nvcc_dlink = ["-dlink", f"-L{shmem_dir}/lib", f"-l{shmem_lib_name}"]
-    extra_link_args = [f"-l:lib{shmem_lib_name}.a", f"-Wl,-rpath,{shmem_dir}/lib"]
+    # Prefer the static archive; fall back to the shared library when only it is
+    # available (e.g. rocSHMEM bundled inside the ROCm installation).
+    if os.path.exists(os.path.join(shmem_dir, "lib", f"lib{shmem_lib_name}.a")):
+        extra_link_args = [f"-l:lib{shmem_lib_name}.a", f"-Wl,-rpath,{shmem_dir}/lib"]
+    else:
+        extra_link_args = [f"-l{shmem_lib_name}", f"-Wl,-rpath,{shmem_dir}/lib"]
     if variant == "cuda":
         extra_link_args.append("-l:nvshmem_bootstrap_uid.so")
     elif variant == "rocm":
